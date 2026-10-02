@@ -1,0 +1,22 @@
+from __future__ import annotations
+
+import argparse
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+
+from machinera import Machinera
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Transcribe a local audio file.")
+    parser.add_argument("file", type=Path)
+    args = parser.parse_args(argv)
+    with Machinera() as client:
+        result = client.transcribe_file(args.file, model="transcribe-v1")
+    sys.stdout.write(result.text)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
