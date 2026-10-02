@@ -21,6 +21,7 @@ Machinera(
     limits: Limits | None = None,
     max_concurrency: int | None = None,
     transport: Literal["auto", "job"] | httpx.BaseTransport = "auto",
+    sync_replay: Literal["never", "always"] = "never",
     http_client: httpx.Client | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
@@ -46,6 +47,7 @@ Omitted `timeout` and `max_retries` use the defaults declared in
 | `limits` | `None` constructs `Limits()`. |
 | `max_concurrency` | Positive integer limiting active operations, or `None` for no client semaphore. Waits count toward the deadline. |
 | `transport` | `"auto"` selects inline sync or a durable job by encoded size, falling back to a durable job when the synchronous route refuses admission (see `transcribe_file`); `"job"` always selects a durable job. A custom `httpx.BaseTransport` injects HTTP behavior while keeping automatic selection. |
+| `sync_replay` | Exactly `"never"` (the default) or `"always"`; any other value raises `ValueError`. Controls only an unkeyed synchronous request that fails after its body was sent: a lost response, or a retryable status response such as a 502, 503, or 504. `"never"` raises `AmbiguousSubmissionError` for a lost response and does not replay either case. `"always"` replays the identical request under `RetryPolicy.max_attempts`, the same backoff, and the call deadline; exhausted attempts raise the last error (`APIConnectionError`, `APITimeoutError`, or the status error) with `is_transient` `True`, and an expired deadline raises `DeadlineExceededError`. Responses that are not retryable are never replayed, and the job-fallback refusals (`inline_claim_timeout`, `inline_admission_refused`, `no_serving_capacity`) keep their existing attempts before the fallback. A replayed request may run, and be billed, more than once; see [Replaying synchronous requests](README.md#replaying-synchronous-requests). Keyed calls, durable jobs, polling, uploads, and the auto-mode job fallback are unaffected. |
 | `http_client` | Optional caller-owned `httpx.Client`; cannot be combined with a custom transport. Its pool settings and lifetime remain the caller's responsibility. |
 | `clock`, `sleeper` | Monotonic time and delay functions, injectable for tests. |
 | `wall_clock` | Wall time for HTTP-date `Retry-After` parsing. |
@@ -63,7 +65,7 @@ cannot be overridden. Other defaults such as User-Agent can be overridden.
 Raises `ValueError` for invalid configuration or conflicting retry controls;
 `TypeError` for an unsupported timeout form or HTTP client type. Configuration is
 immutable. Public attributes are `default_headers`, `base_url`, `timeout`,
-`retry_policy`, `limits`, `max_concurrency`, and `transport`; the latter is
+`retry_policy`, `limits`, `max_concurrency`, `transport`, and `sync_replay`; `transport` is
 `"auto"` when a custom HTTP transport is injected. Independent calls may share a
 client across threads. Do not share a file cursor between concurrent calls.
 
@@ -198,9 +200,10 @@ lost after sending, any other failure, and `transport="job"` never take this pat
 Raises the common operation exceptions below, plus `PayloadTooLargeError` for
 service upload or local descriptor size limits, `ValueError` for invalid input values or simultaneous use of
 one handle, and `TypeError` for unsupported input types. `IntegrityError` reports
-changes to file size or content during preparation or streaming. An unanswered
-sync request that might have executed raises `AmbiguousSubmissionError`; never
-blindly retry it.
+changes to file size or content during preparation or streaming. With the default
+`sync_replay="never"`, an unanswered sync request that might have executed raises
+`AmbiguousSubmissionError`; never blindly retry it. With `sync_replay="always"`, the
+SDK replays it instead, as described under the `sync_replay` constructor parameter.
 
 #### `transcribe_url`
 
@@ -308,7 +311,11 @@ for HTTP failures as mapped below. `APIConnectionError` covers network failures,
 closed clients, exhausted connection retries, and local I/O failures.
 `APIResponseValidationError` reports a response body or shape the SDK cannot use
 and is never retried automatically. `APITimeoutError` covers HTTP phase timeouts where replay is safe;
-possible sync execution instead raises `AmbiguousSubmissionError`.
+possible sync execution instead raises `AmbiguousSubmissionError` with the default
+`sync_replay="never"`. With `sync_replay="always"`, such a request is replayed; when
+replays run out the last `APIConnectionError`, `APITimeoutError`, or status error is
+raised with `is_transient` true, and an expired deadline raises
+`DeadlineExceededError` (see the `sync_replay` constructor parameter).
 `DeadlineExceededError` bounds total work and polling; `TranscriptionInterrupted`
 wraps keyboard interruption with recovery context. Both are `RecoverableJobError`. `TerminalJobError` reports an
 observed failed job, or a status other than `"queued"`, `"processing"`, or
@@ -566,9 +573,9 @@ matching row applies:
 | --- | --- |
 | `RecoverableJobError` | `True` when `job_id` is set (resume that job; do not resubmit), otherwise `False` |
 | `APIConnectionError` from local file I/O or a closed client | `False` |
-| Other `APIConnectionError`, including `APITimeoutError` | `True` unless `retryable` is `False`; in the `"sync_submit"` phase only when `retryable` is `True` (nothing was sent) |
+| Other `APIConnectionError`, including `APITimeoutError` | `True` unless `retryable` is `False`; in the `"sync_submit"` phase only when `retryable` is `True`: nothing was sent, or `sync_replay="always"` replayed a request that failed after sending (`connection_replayable` in [`_exceptions.py`](src/machinera/_exceptions.py)) |
 | `AuthenticationError`, `PermissionDeniedError` | `False` |
-| Other `APIStatusError`, including `RateLimitError` | `True` only when `retryable` is `True`; in the `"sync_submit"` phase additionally only for HTTP 429 or a refusal code proving the request did not run (`SYNC_REPLAYABLE_CODES` in [`_exceptions.py`](src/machinera/_exceptions.py)) |
+| Other `APIStatusError`, including `RateLimitError` | `True` only when `retryable` is `True`; in the `"sync_submit"` phase additionally only for HTTP 429, a refusal code proving the request did not run (`SYNC_REPLAYABLE_CODES`), or, with `sync_replay="always"`, any code except the job-fallback refusals (`SYNC_FALLBACK_CODES`); both sets and `retry_eligible` are in [`_exceptions.py`](src/machinera/_exceptions.py) |
 | Anything else, including `AmbiguousSubmissionError`, `TerminalJobError`, `UploadError`, and `APIResponseValidationError` | `False` |
 
 ### `RecoverableJobError`
@@ -580,8 +587,10 @@ no job ID was observed. `None` does not prove that no job was accepted: an admis
 response can be lost, or the call can end before the ID arrives. Recover by repeating
 the identical call with `idempotency_key=error.operation_key`, never a fresh key; the
 service replays the original job if it exists. In the `"sync_submit"` phase there is
-no key to replay, so reconcile instead. The other recovery context comes from
-`APIError`.
+no key to replay: with the default `sync_replay="never"`, reconcile instead; with
+`sync_replay="always"`, the call may be repeated, accepting a possible duplicate
+charge (see [Replaying synchronous requests](README.md#replaying-synchronous-requests)).
+The other recovery context comes from `APIError`.
 
 ### `APIError`
 
@@ -659,7 +668,7 @@ adds the keyword-only `ambiguous: bool` and forwards every other keyword to `API
 | `APITimeoutError` | `APIConnectionError` | HTTP phase timeout where replay is safe. |
 | `APIResponseValidationError` | `APIError` | Malformed or unexpected response body or shape; never retried automatically. `status_code` is set when a response exists. |
 | `DeadlineExceededError` | `APIError`, `RecoverableJobError` | Call deadline, required wait, or explicit `max_polls` cap exhausted; recover accepted work. |
-| `AmbiguousSubmissionError` | `APIError` | Sync execution may have started; reconcile before any resubmission. |
+| `AmbiguousSubmissionError` | `APIError` | Sync execution may have started; reconcile before any resubmission. Not raised for an after-send failure when `sync_replay="always"`. |
 | `TerminalJobError` | `APIError` | Failed job observed during a status read, possibly HTTP 200, or an unrecognized status while polling; `last_status` holds the status. |
 | `UploadError` | `APIError` | Base upload failure type; every non-429 service error whose `code` starts with `upload_` raises it (or `IntegrityError`) instead of a status-specific class, except a failed job's `TerminalJobError`, so `upload_not_found` means restart the upload. |
 | `IntegrityError` | `UploadError` | Input changed during preparation or streaming. |

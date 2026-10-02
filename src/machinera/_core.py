@@ -29,6 +29,7 @@ from ._contract import (
     SERVED_LANGUAGE,
 )
 from ._exceptions import (
+    SYNC_FALLBACK_CODES,
     AmbiguousSubmissionError,
     APIConnectionError,
     APIError,
@@ -49,6 +50,7 @@ from ._exceptions import (
     TerminalJobError,
     UnprocessableEntityError,
     UploadError,
+    connection_replayable,
     retry_eligible,
 )
 from ._files import FileContent, FileInput, unpack_file, validate_headers
@@ -70,17 +72,6 @@ from ._types import (
 from ._uploads import Grant, descriptor, initialization_key, storage_code
 from ._version import __version__
 
-# Synchronous admission refusals: the service accepted no work, so the body can be
-# submitted once as a durable job. Only codes the contract marks retryable qualify.
-_SYNC_FALLBACK_CODES = frozenset(
-    entry.code
-    for entry in (
-        _codes.inline_claim_timeout,
-        _codes.inline_admission_refused,
-        _codes.no_serving_capacity,
-    )
-    if entry.retryable
-)
 _SIZE_REFUSAL_CODES = (None, _codes.sync_size_cap.code, _codes.inline_body_over_cap.code)
 _PENDING_STATUSES = ("queued", "processing")
 _SECONDS = re.compile(r"[0-9]+(?:\.[0-9]*)?|\.[0-9]+")
@@ -219,6 +210,7 @@ class Core:
     limits: Limits
     max_concurrency: int | None
     transport: Literal["auto", "job"]
+    sync_replay: Literal["never", "always"]
     _api_key: str = field(repr=False)
     _owns_http: bool
     _clock: Callable[[], float]
@@ -239,6 +231,7 @@ class Core:
         limits: Limits | None = None,
         max_concurrency: int | None = None,
         transport: Any = "auto",
+        sync_replay: str = "never",
         http_client: Any = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
@@ -273,6 +266,8 @@ class Core:
             or url.path.rstrip("/") not in ("", "/v1")
         ):
             raise ValueError("base_url must be an HTTP(S) API origin, optionally followed by /v1")
+        if sync_replay not in ("never", "always"):
+            raise ValueError("sync_replay must be never or always")
         if not isinstance(api_key, str) or not re.fullmatch(r"[!-~]+", api_key):
             raise ValueError("api_key must be a nonempty ASCII credential without whitespace")
         if max_concurrency is not None and (
@@ -293,6 +288,7 @@ class Core:
             "limits": limits or Limits(),
             "max_concurrency": max_concurrency,
             "transport": "auto" if injected else transport,
+            "sync_replay": sync_replay,
             "_api_key": api_key,
             "_clock": clock,
             "_wall_clock": wall_clock,
@@ -419,6 +415,7 @@ class Core:
         body: bytes | Multipart | UploadBody = b"",
         headers: dict[str, str] | None = None,
         replay_safe: bool = True,
+        replay_after_send: bool = False,
         storage: bool = False,
         before_attempt: Callable[[], Flow[tuple[str, dict[str, str]] | None]] | None = None,
     ) -> Flow[httpx.Response]:
@@ -458,7 +455,7 @@ class Core:
             eligible = False
 
             def expired(request_end: float = request_end) -> BaseException:
-                if not replay_safe:
+                if not (replay_safe or replay_after_send):
                     return AmbiguousSubmissionError(
                         "Submission deadline exceeded; synchronous execution may have started",
                         retryable=False,
@@ -483,7 +480,7 @@ class Core:
                 unsent = isinstance(
                     exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
                 )
-                if unsent or replay_safe:
+                if connection_replayable(unsent, replay_safe, replay_after_send):
                     cls = (
                         APITimeoutError
                         if isinstance(exc, httpx.TimeoutException)
@@ -536,7 +533,11 @@ class Core:
                 else:
                     error = self._error(response)
                 eligible = retry_eligible(
-                    response.status_code, error.code, error.retryable, replay_safe
+                    response.status_code,
+                    error.code,
+                    error.retryable,
+                    replay_safe,
+                    replay_after_send,
                 )
             if isinstance(error, AmbiguousSubmissionError):
                 raise error
@@ -877,6 +878,7 @@ class Core:
                         body=body,
                         headers=body.headers,
                         replay_safe=False,
+                        replay_after_send=self.sync_replay == "always",
                     )
                 except APIStatusError as error:
                     refusal = error
@@ -891,7 +893,7 @@ class Core:
                     isinstance(refusal, PayloadTooLargeError)
                     and refusal.code in _SIZE_REFUSAL_CODES
                 )
-                unadmitted = refusal.code in _SYNC_FALLBACK_CODES and refusal.retryable is True
+                unadmitted = refusal.code in SYNC_FALLBACK_CODES and refusal.retryable is True
                 if not (sized or unadmitted):
                     raise refusal
             call.phase = "job_submit"
@@ -1012,5 +1014,6 @@ class Core:
         error.__context__ = None
         error.__cause__ = None
         if isinstance(error, APIError):
+            error._sync_replay = self.sync_replay == "always"
             error.request_id = error.request_id or call.request_id
             error._file_released = call.file_released

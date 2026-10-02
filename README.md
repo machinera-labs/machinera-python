@@ -93,9 +93,11 @@ The rules behind this recipe:
 - **Keyed calls are durable jobs.** An `idempotency_key` (or `transport="job"`)
   submits a server job that can be resumed. Without one, a file whose encoded
   request fits `Limits.sync_inline_body_bytes` is sent as a single synchronous
-  request. If that request's response is lost, the SDK raises
+  request. If that request's response is lost, the SDK by default raises
   `AmbiguousSubmissionError`: the transcription may already have run, so reconcile
-  (check what you already received or were billed for) instead of resubmitting.
+  (check what you already received or were billed for) instead of resubmitting. To
+  replay such requests instead, accepting a possible duplicate charge, see
+  [Replaying synchronous requests](#replaying-synchronous-requests).
 - **Reuse a key only for the identical request:** same file bytes, metadata,
   options, credentials, and endpoint. Use a fresh key for every independent
   transcription. Every `APIError` carries the call's key in `operation_key`, including
@@ -112,12 +114,12 @@ What to do after a failure; use the first row that matches:
 | Exception | Meaning | Next step |
 | --- | --- | --- |
 | `TerminalJobError` | The job failed. | Inspect `code` before deciding on a new job. |
-| `AmbiguousSubmissionError` | An unkeyed synchronous request may have run. | Reconcile; do not resubmit. |
+| `AmbiguousSubmissionError` | An unkeyed synchronous request may have run (raised only with the default `sync_replay="never"`). | Reconcile; do not resubmit. |
 | `AuthenticationError`, `PermissionDeniedError` | The credential was refused. | Check the API key and its access. |
 | `BadRequestError`, `UnprocessableEntityError`, `PayloadTooLargeError` | The request is invalid. | Correct the input. |
 | `IntegrityError`, other `UploadError` | The file changed, or storage or the service refused the upload. | Keep the file unchanged and see [Large files](#large-files). |
 | `TranscriptionInterrupted` with `ambiguous` true | An unkeyed synchronous request was interrupted and may have run. | Reconcile; do not resubmit. |
-| Any other `APIError` except `RateLimitError` with `phase == "sync_submit"` | An unkeyed synchronous request failed after it may have run. | Reconcile; do not resubmit. |
+| Any other `APIError` except `RateLimitError` with `phase == "sync_submit"` | An unkeyed synchronous request failed after it may have run. | With the default `sync_replay="never"`, reconcile; do not resubmit. With `sync_replay="always"`, repeat the call if `is_transient` is true or the error is a `DeadlineExceededError`, accepting a possible duplicate charge (see [Replaying synchronous requests](#replaying-synchronous-requests)). |
 | `NotFoundError`, `ConflictError` | The job is unknown to this credential and endpoint, or the service cannot replay the key. | Reconcile; do not resubmit under a new key. |
 | Any other `APIError` with `job_id` set | The job was accepted and may still be running. | `resume(job_id)` |
 | `DeadlineExceededError`, `TranscriptionInterrupted`, `APIConnectionError`, `APIResponseValidationError`, `RateLimitError`, `InternalServerError` | Admission was not confirmed. | Repeat the identical call with `idempotency_key=error.operation_key`, after a pause for rate limits and server errors. |
@@ -162,6 +164,8 @@ falling back.
   staged uploads (see [Large files](#large-files)).
 - `max_concurrency` optionally bounds the number of active calls; waiting for a slot
   counts toward the call's deadline.
+- `sync_replay` is `"never"` unless set to `"always"`; see
+  [Replaying synchronous requests](#replaying-synchronous-requests).
 
 No dotenv files are loaded and no endpoints are probed. Client configuration is
 immutable. One `Machinera` client can be shared by threads, and one
@@ -238,9 +242,12 @@ and `resume` also accept `deadline=seconds` to override the total budget for one
 call. HTTP phase values follow
 [httpx timeout semantics](https://www.python-httpx.org/advanced/timeouts/).
 
-A deadline raises `DeadlineExceededError` (or `AmbiguousSubmissionError` for an
-unkeyed synchronous request that may have started) and keeps the operation key and
-any accepted job ID for [recovery](#recover-an-interrupted-transcription).
+A deadline raises `DeadlineExceededError` and keeps the operation key and any
+accepted job ID for [recovery](#recover-an-interrupted-transcription). With the
+default `sync_replay="never"`, a deadline during an unkeyed synchronous request that
+may have started raises `AmbiguousSubmissionError` instead; with
+`sync_replay="always"` it raises `DeadlineExceededError`, which may be repeated as
+described in [Replaying synchronous requests](#replaying-synchronous-requests).
 
 ## Retries
 
@@ -399,6 +406,30 @@ def transcribe(client: Machinera, sample_id: str, path: str) -> str:
 
 with Machinera(max_concurrency=8) as client:
     text = transcribe(client, "sample-0001", "sample-0001.wav")
+```
+
+### Replaying synchronous requests
+
+An unkeyed synchronous request that fails after its body was sent (the response is
+lost, or the service answers with a retryable error such as a 502, 503, or 504) may
+already have run, and been billed. By default the SDK therefore never replays it: a
+lost response raises `AmbiguousSubmissionError` and an error response is raised as is.
+
+`sync_replay="always"` replays such a request
+anyway, as the identical request, under the normal retry policy and deadline, so a
+call can be billed more than once. Enable it only when finishing a long batch matters
+more than an occasional duplicate charge. Non-retryable responses are never replayed,
+and keyed calls, durable jobs, and the automatic fallback to a durable job are
+unaffected. When replays run out, the last error is raised with `is_transient` true.
+
+The policy applies only to the synchronous route, so call `transcribe_file` without an
+`idempotency_key`, on a file within `Limits.sync_inline_body_bytes`:
+
+```python
+from machinera import Machinera
+
+with Machinera(sync_replay="always", max_concurrency=8) as client:
+    result = client.transcribe_file("short-clip.wav", model="transcribe-v1")
 ```
 
 ## Logging

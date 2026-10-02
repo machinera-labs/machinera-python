@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.1.2 — 2026-10-02
+
+### Added
+
+- The `sync_replay="always"` constructor option on both clients replays
+  an unkeyed synchronous request that failed after its body was sent (a lost response
+  or a retryable error response), under the normal retry policy and deadline, instead
+  of raising `AmbiguousSubmissionError` or the error response.
+  A replayed request may be billed more than once, so enable it only when finishing a
+  long batch matters more than an occasional duplicate charge; the default `"never"`
+  keeps the previous behavior.
+
 ## 0.1.1 — 2026-10-02
 
 ### Changed

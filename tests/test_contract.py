@@ -413,6 +413,23 @@ def test_closed_client_is_not_transient(asynchronous: bool) -> None:
     assert caught.value.is_transient is False
 
 
+@pytest.mark.parametrize(
+    "code,replay,transient",
+    [
+        (None, False, False),
+        (None, True, True),
+        ("inline_claim_timeout", True, False),
+        ("no_serving_capacity", True, True),
+    ],
+)
+def test_sync_replay_status_transience(code: str | None, replay: bool, transient: bool) -> None:
+    error = m.InternalServerError(
+        "x", status_code=503, code=code, retryable=True, phase="sync_submit"
+    )
+    error._sync_replay = replay
+    assert error.is_transient is transient
+
+
 def test_recoverable_job_errors_share_one_marker() -> None:
     recoverable = (m.DeadlineExceededError, m.TranscriptionInterrupted)
     for cls in recoverable:

@@ -16,15 +16,46 @@ SYNC_REPLAYABLE_CODES = frozenset(
 }
 
 
-def retry_eligible(
-    status: int | None, code: str | None, retryable: bool | None, replay_safe: bool
-) -> bool:
-    """Whether a received error response may be retried; the retry loop and is_transient agree."""
-    return (
-        (replay_safe or status == 429 or code in SYNC_REPLAYABLE_CODES)
-        and retryable is True
-        and status not in (401, 403)
+# Synchronous admission refusals: the service accepted no work, so the body can be
+# submitted once as a durable job. Only codes the contract marks retryable qualify.
+SYNC_FALLBACK_CODES = frozenset(
+    entry.code
+    for entry in (
+        _codes.inline_claim_timeout,
+        _codes.inline_admission_refused,
+        _codes.no_serving_capacity,
     )
+    if entry.retryable
+)
+
+
+def retry_eligible(
+    status: int | None,
+    code: str | None,
+    retryable: bool | None,
+    replay_safe: bool,
+    replay_after_send: bool = False,
+) -> bool:
+    """Whether a received error response may be retried; the retry loop and is_transient agree.
+
+    replay_after_send (sync_replay="always") also replays a synchronous request after any
+    retryable response, except the job-fallback codes, whose handling it leaves unchanged.
+    """
+    replayable = (
+        replay_safe
+        or status == 429
+        or code in SYNC_REPLAYABLE_CODES
+        or (replay_after_send and code not in SYNC_FALLBACK_CODES)
+    )
+    return replayable and retryable is True and status not in (401, 403)
+
+
+def connection_replayable(unsent: bool, replay_safe: bool, replay_after_send: bool) -> bool:
+    """Whether a failed exchange may be retried; the retry loop records it as retryable.
+
+    replay_after_send is the opt-in sync_replay="always" policy for synchronous requests.
+    """
+    return unsent or replay_safe or replay_after_send
 
 
 class MachineraError(Exception):
@@ -36,8 +67,11 @@ class MachineraError(Exception):
 
         A RecoverableJobError is transient only with a job_id: resume that job. A status
         error is transient when the SDK's own retry rule would retry it, treating the
-        "sync_submit" phase as not replay-safe. A local failure (file I/O or a closed
-        client) is never transient.
+        "sync_submit" phase as not replay-safe. A connection error in that phase is
+        transient when the retry loop marked it retryable via connection_replayable,
+        including after-send failures under sync_replay="always"; under that policy a
+        retryable status response in that phase follows retry_eligible's replay rule.
+        A local failure (file I/O or a closed client) is never transient.
         """
         if isinstance(self, RecoverableJobError):
             return self.job_id is not None
@@ -47,7 +81,9 @@ class MachineraError(Exception):
         if isinstance(self, APIConnectionError):
             return self.retryable is True or (self.retryable is None and unsent)
         if isinstance(self, APIStatusError):
-            return retry_eligible(self.status_code, self.code, self.retryable, unsent)
+            return retry_eligible(
+                self.status_code, self.code, self.retryable, unsent, self._sync_replay
+            )
         return False
 
 
@@ -101,6 +137,7 @@ class APIError(MachineraError):
         self._file_released: threading.Event | None = None
         self._inline_cap: int | None = None
         self._local = False
+        self._sync_replay = False
 
     def __str__(self) -> str:
         text = super().__str__()
@@ -171,8 +208,9 @@ class APIResponseValidationError(APIError):
 class DeadlineExceededError(APIError, RecoverableJobError):
     """Call budget exhausted; resume job_id when set, as the job may still be running.
 
-    With phase "sync_submit", reconcile instead of resubmitting. Otherwise repeat the
-    identical call with idempotency_key=operation_key; never use a fresh key.
+    With phase "sync_submit", reconcile instead of resubmitting under the default
+    sync_replay="never"; under sync_replay="always" the call may be repeated. Otherwise
+    repeat the identical call with idempotency_key=operation_key; never use a fresh key.
     """
 
 

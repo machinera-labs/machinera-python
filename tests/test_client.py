@@ -24,6 +24,7 @@ from machinera import (
     APIConnectionError,
     APIResponseValidationError,
     APIStatusError,
+    APITimeoutError,
     AsyncMachinera,
     AuthenticationError,
     ConflictError,
@@ -312,6 +313,208 @@ def test_sync_ambiguous_never_resubmitted(failure: Any) -> None:
     assert error.operation_key and error.phase == "sync_submit"
     assert error.__cause__ is None and error.__context__ is None
     assert CREDENTIAL not in str(error) and "https://" not in str(error)
+
+
+POST_SEND = [httpx.ReadTimeout, httpx.WriteError, httpx.RemoteProtocolError]
+UNADMITTED = ["inline_claim_timeout", "inline_admission_refused", "no_serving_capacity"]
+
+
+def sync_upload(sdk: Any, **kwargs: Any) -> Any:
+    return sdk.transcribe_file(
+        io.BytesIO(b"audio"), model=MODEL, content_type="audio/wav", **kwargs
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("failure", POST_SEND)
+def test_sync_replay_always_replays_identical_request(failure: Any, asynchronous: bool) -> None:
+    clock = Clock()
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            raise failure("dropped after send")
+        return httpx.Response(200, json={"text": "again"})
+
+    with client(handler, clock, asynchronous=asynchronous, sync_replay="always") as sdk:
+        assert sync_upload(sdk).text == "again"
+    first, second = requests
+    assert first.url.path == second.url.path == "/v1/audio/transcriptions"
+    assert first.content == second.content and first.headers == second.headers
+    assert clock.sleeps == [0.4375]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("failure", POST_SEND)
+def test_sync_replay_default_keeps_ambiguity(failure: Any, asynchronous: bool) -> None:
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            raise failure("dropped after send")
+        return httpx.Response(200, json={"text": "again"})
+
+    with client(handler, asynchronous=asynchronous) as sdk:
+        assert sdk.sync_replay == "never"
+        with pytest.raises(AmbiguousSubmissionError) as caught:
+            sync_upload(sdk)
+    assert len(requests) == 1 and caught.value.is_transient is False
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "failure,kind", [(httpx.ReadTimeout, APITimeoutError), (httpx.WriteError, APIConnectionError)]
+)
+def test_sync_replay_exhaustion_raises_transient_error(
+    failure: Any, kind: type[APIConnectionError], asynchronous: bool
+) -> None:
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise failure("dropped after send")
+
+    with client(handler, asynchronous=asynchronous, sync_replay="always") as sdk:
+        with pytest.raises(kind) as caught:
+            sync_upload(sdk)
+    error = caught.value
+    assert type(error) is kind and not isinstance(error, AmbiguousSubmissionError)
+    assert error.phase == "sync_submit" and error.retryable is True and error.is_transient
+    assert len(requests) == RetryPolicy().max_attempts
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_sync_replay_deadline_is_not_ambiguous(asynchronous: bool) -> None:
+    clock = Clock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        clock.now += 20
+        raise httpx.ReadTimeout("dropped after send")
+
+    with client(handler, clock, asynchronous=asynchronous, sync_replay="always") as sdk:
+        with pytest.raises(DeadlineExceededError) as caught:
+            sync_upload(sdk, deadline=10)
+    assert caught.value.phase == "sync_submit" and caught.value.job_id is None
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("policy", ["always", "never"])
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_sync_replay_replays_retryable_responses(
+    status: int, policy: str, asynchronous: bool
+) -> None:
+    clock = Clock()
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(status, json={"error": {"retryable": True}})
+        return httpx.Response(200, json={"text": "again"})
+
+    with client(handler, clock, asynchronous=asynchronous, sync_replay=policy) as sdk:
+        if policy == "always":
+            assert sync_upload(sdk).text == "again"
+            assert len(requests) == 2 and requests[0].content == requests[1].content
+            assert clock.sleeps == [0.4375]
+        else:
+            with pytest.raises(InternalServerError) as caught:
+                sync_upload(sdk)
+            assert len(requests) == 1 and caught.value.is_transient is False
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_sync_replay_exhausted_responses_are_transient(asynchronous: bool) -> None:
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, json={"error": {"retryable": True}})
+
+    with client(handler, asynchronous=asynchronous, sync_replay="always") as sdk:
+        with pytest.raises(InternalServerError) as caught:
+            sync_upload(sdk)
+    assert len(requests) == RetryPolicy().max_attempts
+    assert caught.value.phase == "sync_submit" and caught.value.is_transient is True
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("error", [{"retryable": False}, {"code": "service_unavailable"}])
+def test_sync_replay_never_replays_non_retryable_responses(
+    error: dict[str, Any], asynchronous: bool
+) -> None:
+    requests = []
+    if "code" in error:
+        error = {**error, "retryable": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, json={"error": error})
+
+    with client(handler, asynchronous=asynchronous, sync_replay="always") as sdk:
+        with pytest.raises(InternalServerError) as caught:
+            sync_upload(sdk)
+    assert len(requests) == 1 and caught.value.is_transient is False
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("policy", ["always", "never"])
+@pytest.mark.parametrize("code", UNADMITTED)
+def test_sync_replay_leaves_fallback_attempts_unchanged(
+    code: str, policy: str, asynchronous: bool
+) -> None:
+    sync = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/audio/transcriptions":
+            sync.append(request)
+            return refused(code)
+        if request.method == "POST":
+            return httpx.Response(202, json={"id": "job-1", "status": "queued"})
+        return completed()
+
+    with client(handler, asynchronous=asynchronous, sync_replay=policy) as sdk:
+        assert sync_upload(sdk).job_id == "job-1"
+    assert len(sync) == (1 if code == "inline_claim_timeout" else RetryPolicy().max_attempts)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_sync_replay_keeps_the_job_fallback(asynchronous: bool) -> None:
+    paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/v1/audio/transcriptions":
+            return refused("inline_claim_timeout")
+        if request.method == "POST":
+            return httpx.Response(202, json={"id": "job-1", "status": "queued"})
+        return completed()
+
+    with client(handler, asynchronous=asynchronous, sync_replay="always") as sdk:
+        assert sync_upload(sdk).job_id == "job-1"
+    assert paths == [
+        "/v1/audio/transcriptions",
+        "/v1/transcription_jobs",
+        "/v1/transcription_jobs/job-1",
+    ]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("value", ["never", "always"])
+def test_sync_replay_is_a_constructor_setting(value: str, asynchronous: bool) -> None:
+    with client(lambda _: completed(), asynchronous=asynchronous) as sdk:
+        assert sdk.sync_replay == "never"
+    with client(lambda _: completed(), asynchronous=asynchronous, sync_replay=value) as sdk:
+        assert sdk.sync_replay == value
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("value", ["sometimes", "Always", "", None, True])
+def test_sync_replay_rejects_other_values(value: Any, asynchronous: bool) -> None:
+    with pytest.raises(ValueError, match="sync_replay"):
+        client(lambda _: completed(), asynchronous=asynchronous, sync_replay=value)
 
 
 @pytest.mark.parametrize("status", [429, 503])
@@ -871,9 +1074,6 @@ def test_forced_job_transport_with_injected_client() -> None:
         with Machinera(api_key=CREDENTIAL, base_url=API, transport="job", http_client=http) as sdk:
             sdk.transcribe_file(io.BytesIO(b"audio"), model=MODEL, content_type="audio/wav")
     assert paths[0] == "/v1/transcription_jobs"
-
-
-UNADMITTED = ["inline_claim_timeout", "inline_admission_refused", "no_serving_capacity"]
 
 
 def refused(code: str, retryable: bool = True) -> httpx.Response:
