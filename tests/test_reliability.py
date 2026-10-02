@@ -726,7 +726,11 @@ def test_injected_client_serves_polls_and_stays_open(asynchronous: bool) -> None
 
 
 def assert_stalled_poll_recovers(sdk: Any, state: dict[str, Any]) -> None:
-    sdk.get_job("job-1")
+    # Only the stalled poll runs under the client's short poll_request; the calls that
+    # open a connection (and TLS handshake) get the default budget, so a slow runner
+    # cannot time them out.
+    unhurried = TimeoutPolicy(read=None)
+    sdk.get_job("job-1", timeout=unhurried)
     start = time.monotonic()
     with pytest.raises(APIConnectionError):
         sdk.get_job("job-1")
@@ -736,7 +740,7 @@ def assert_stalled_poll_recovers(sdk: Any, state: dict[str, Any]) -> None:
     while getattr(sdk._lifecycle, "exchanges", 0) and time.monotonic() < stop:
         time.sleep(0.01)
     assert getattr(sdk._lifecycle, "exchanges", 0) == 0
-    assert sdk.get_job("job-1").status == "processing"
+    assert sdk.get_job("job-1", timeout=unhurried).status == "processing"
 
 
 @pytest.mark.parametrize(

@@ -45,7 +45,7 @@ Omitted `timeout` and `max_retries` use the defaults declared in
 | `retry_policy` | Advanced retry and poll configuration; `None` constructs `RetryPolicy()`. |
 | `limits` | `None` constructs `Limits()`. |
 | `max_concurrency` | Positive integer limiting active operations, or `None` for no client semaphore. Waits count toward the deadline. |
-| `transport` | `"auto"` selects inline sync or a durable job by encoded size; `"job"` always selects a durable job. A custom `httpx.BaseTransport` injects HTTP behavior while keeping automatic selection. |
+| `transport` | `"auto"` selects inline sync or a durable job by encoded size, falling back to a durable job when the synchronous route refuses admission (see `transcribe_file`); `"job"` always selects a durable job. A custom `httpx.BaseTransport` injects HTTP behavior while keeping automatic selection. |
 | `http_client` | Optional caller-owned `httpx.Client`; cannot be combined with a custom transport. Its pool settings and lifetime remain the caller's responsibility. |
 | `clock`, `sleeper` | Monotonic time and delay functions, injectable for tests. |
 | `wall_clock` | Wall time for HTTP-date `Retry-After` parsing. |
@@ -186,6 +186,15 @@ wait for file release before reusing a handle and restore the offset yourself if
 needed; `AsyncMachinera` restores it before cancellation propagates. Path-owned files
 close when pending reads finish.
 
+With `transport="auto"`, an unkeyed synchronous request the service refuses before
+admitting any work is submitted once as a durable job instead, with the same encoded
+body, operation key, deadline, and limits; `phase` becomes `"job_submit"`. This
+applies to a size refusal (HTTP 413 without a code, `sync_size_cap`, or
+`inline_body_over_cap`) and, after any eligible synchronous retries, to the retryable
+admission refusals `inline_claim_timeout`, `inline_admission_refused`, and
+`no_serving_capacity` when the service has not marked them non-retryable. A response
+lost after sending, any other failure, and `transport="job"` never take this path.
+
 Raises the common operation exceptions below, plus `PayloadTooLargeError` for
 service upload or local descriptor size limits, `ValueError` for invalid input values or simultaneous use of
 one handle, and `TypeError` for unsupported input types. `IntegrityError` reports
@@ -301,7 +310,7 @@ closed clients, exhausted connection retries, and local I/O failures.
 and is never retried automatically. `APITimeoutError` covers HTTP phase timeouts where replay is safe;
 possible sync execution instead raises `AmbiguousSubmissionError`.
 `DeadlineExceededError` bounds total work and polling; `TranscriptionInterrupted`
-wraps keyboard interruption with recovery context. `TerminalJobError` reports an
+wraps keyboard interruption with recovery context. Both are `RecoverableJobError`. `TerminalJobError` reports an
 observed failed job, or a status other than `"queued"`, `"processing"`, or
 `"completed"` while polling. Local argument validation raises `ValueError` or `TypeError`.
 
@@ -399,13 +408,13 @@ RetryPolicy(
     initial_delay: float = ...,
     max_delay: float = ...,
     poll_interval: float = ...,
-    max_polls: int = ...,
+    max_polls: int | None = ...,
 ) -> RetryPolicy
 ```
 
 Frozen dataclass; defaults are declared in [the policy source](src/machinera/_types.py).
 `max_attempts` includes the initial request per transient-failure step and must be
-a positive integer. `max_polls` is a separate positive integer budget. Delays are
+a positive integer. `max_polls` is `None` or a positive integer. Delays are
 positive finite seconds, with `initial_delay <= max_delay`. Invalid values raise
 `ValueError` or `TypeError`. Retry delay is
 `min(initial_delay * 2**retry_index, max_delay)` multiplied by uniform jitter in
@@ -413,6 +422,13 @@ positive finite seconds, with `initial_delay <= max_delay`. Invalid values raise
 that cap; a valid `retry-after-ms` header takes precedence over `Retry-After`. A
 required wait that cannot fit inside the deadline raises `DeadlineExceededError`. Normal polls use `poll_interval`, subject to
 `Retry-After`, without consuming transient attempts.
+
+Polling rule: the call's deadline is the only thing that ends polling of a pending
+job. Every call has one, either `deadline=` or the inherited `TimeoutPolicy.deadline`,
+so polling is always bounded. `max_polls=None` adds no count limit; a positive
+`max_polls` is an additional hard cap on status reads, and reaching it raises
+`DeadlineExceededError` with the accepted `job_id`. A terminal status ends polling
+earlier, as described under `TerminalJobError`.
 
 ### `Limits`
 
@@ -542,6 +558,31 @@ reported by staged failures.
 base of all SDK exceptions. Recovery metadata is defined on its `APIError`
 subclass. Local argument validation uses built-in `ValueError` or `TypeError`.
 
+Read-only `is_transient: bool` is `True` when trying again later may succeed. It is
+never `True` for a response the SDK's own retry loop refuses to retry. The first
+matching row applies:
+
+| Error | `is_transient` |
+| --- | --- |
+| `RecoverableJobError` | `True` when `job_id` is set (resume that job; do not resubmit), otherwise `False` |
+| `APIConnectionError` from local file I/O or a closed client | `False` |
+| Other `APIConnectionError`, including `APITimeoutError` | `True` unless `retryable` is `False`; in the `"sync_submit"` phase only when `retryable` is `True` (nothing was sent) |
+| `AuthenticationError`, `PermissionDeniedError` | `False` |
+| Other `APIStatusError`, including `RateLimitError` | `True` only when `retryable` is `True`; in the `"sync_submit"` phase additionally only for HTTP 429 or a refusal code proving the request did not run (`SYNC_REPLAYABLE_CODES` in [`_exceptions.py`](src/machinera/_exceptions.py)) |
+| Anything else, including `AmbiguousSubmissionError`, `TerminalJobError`, `UploadError`, and `APIResponseValidationError` | `False` |
+
+### `RecoverableJobError`
+
+`RecoverableJobError` extends `MachineraError` and marks a call that ended while its
+job may still run: `DeadlineExceededError` and `TranscriptionInterrupted`. It is not
+raised on its own. `job_id: str | None` is the job to pass to `resume`, or `None` when
+no job ID was observed. `None` does not prove that no job was accepted: an admission
+response can be lost, or the call can end before the ID arrives. Recover by repeating
+the identical call with `idempotency_key=error.operation_key`, never a fresh key; the
+service replays the original job if it exists. In the `"sync_submit"` phase there is
+no key to replay, so reconcile instead. The other recovery context comes from
+`APIError`.
+
 ### `APIError`
 
 ```python
@@ -563,8 +604,9 @@ APIError(
 ```
 
 Extends `MachineraError`. Every subclass below inherits this constructor and
-these public attributes. `message` supplies the exception string and is also an
-attribute. `status_code` is the HTTP status when available; `status: int | None`
+these public attributes. `message` is the exception's argument and is also an
+attribute. `str(error)` is `message`, followed by ` (request_id: <id>)` when
+`request_id` is known; quote that ID when contacting support. `status_code` is the HTTP status when available; `status: int | None`
 is a read-only alias. `code` and `retryable` expose service
 guidance when available. `DeadlineExceededError` and `AmbiguousSubmissionError`
 always set `retryable=False`, including when constructed with a different value.
@@ -613,16 +655,16 @@ adds the keyword-only `ambiguous: bool` and forwards every other keyword to `API
 | `UnprocessableEntityError` | `APIStatusError` | HTTP 422; correct the request content. |
 | `RateLimitError` | `APIStatusError` | HTTP 429 after eligible retries; inspect guidance. |
 | `InternalServerError` | `APIStatusError` | HTTP 5xx after eligible retries, including 503. |
-| `APIConnectionError` | `APIError` | Network, local I/O, or lifecycle failure. |
+| `APIConnectionError` | `APIError` | Network, local I/O, or lifecycle failure. A local I/O failure's message names the original exception class and, when present, its `errno`, never a path. |
 | `APITimeoutError` | `APIConnectionError` | HTTP phase timeout where replay is safe. |
 | `APIResponseValidationError` | `APIError` | Malformed or unexpected response body or shape; never retried automatically. `status_code` is set when a response exists. |
-| `DeadlineExceededError` | `APIError` | Total call, required-wait, or polling budget exhausted; recover accepted work. |
+| `DeadlineExceededError` | `APIError`, `RecoverableJobError` | Call deadline, required wait, or explicit `max_polls` cap exhausted; recover accepted work. |
 | `AmbiguousSubmissionError` | `APIError` | Sync execution may have started; reconcile before any resubmission. |
 | `TerminalJobError` | `APIError` | Failed job observed during a status read, possibly HTTP 200, or an unrecognized status while polling; `last_status` holds the status. |
 | `UploadError` | `APIError` | Base upload failure type; every non-429 service error whose `code` starts with `upload_` raises it (or `IntegrityError`) instead of a status-specific class, except a failed job's `TerminalJobError`, so `upload_not_found` means restart the upload. |
 | `IntegrityError` | `UploadError` | Input changed during preparation or streaming. |
 | `TerminalIntegrityError` | `IntegrityError`, `TerminalJobError` | A job failed with `upload_integrity_mismatch`; resuming the same `job_id` cannot succeed. |
-| `TranscriptionInterrupted` | `APIError`, `KeyboardInterrupt` | Interrupted operation with safe recovery context. Read-only `ambiguous: bool` is `True` when an unkeyed synchronous request was interrupted and may have run; reconcile instead of resubmitting. |
+| `TranscriptionInterrupted` | `APIError`, `RecoverableJobError`, `KeyboardInterrupt` | Interrupted operation with safe recovery context. Read-only `ambiguous: bool` is `True` when an unkeyed synchronous request was interrupted and may have run; reconcile instead of resubmitting. |
 
 Other unsuccessful HTTP statuses use `APIStatusError` directly.
 

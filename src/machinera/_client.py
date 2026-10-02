@@ -20,6 +20,7 @@ from ._core import (
     Sleep,
     _Call,
     _sanitized,
+    local_failure,
 )
 from ._exceptions import (
     APIConnectionError,
@@ -151,6 +152,7 @@ class Machinera(Core):
         with life.condition:
             if life.closed:
                 error = APIConnectionError("Client is closed")
+                error._local = True
                 self._attach(error, call)
                 raise error
             life.active += 1
@@ -183,8 +185,8 @@ class Machinera(Core):
                 "Transcription interrupted; use recovery context",
                 ambiguous=key is None and call.phase == "sync_submit",
             )
-        except (OSError, httpx.HTTPError):
-            failure = APIConnectionError("Local I/O or HTTP operation failed")
+        except (OSError, httpx.HTTPError) as local:
+            failure = local_failure(local)
         finally:
             if acquired and life.semaphore is not None:
                 life.semaphore.release()

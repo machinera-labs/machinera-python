@@ -153,7 +153,10 @@ falling back.
   [`_files.py`](https://github.com/machinera-labs/machinera-python/blob/main/src/machinera/_files.py))
   raise `ValueError` before any request.
 - `transport="job"` sends every call as a durable job. The default, `"auto"`, picks
-  synchronous, inline durable-job, or staged submission by encoded size.
+  synchronous, inline durable-job, or staged submission by encoded size. When the
+  synchronous route refuses a request before admitting any work (it is too large,
+  or the service has no capacity for it right now), `"auto"` submits the same body
+  once as a durable job under the same operation key and deadline instead of raising.
 - `limits=Limits(...)` changes the encoded request sizes behind that choice; it does
   not change service limits. Durable jobs above `Limits.job_inline_body_bytes` use
   staged uploads (see [Large files](#large-files)).
@@ -245,7 +248,11 @@ Retry defaults are declared by the
 [`RetryPolicy` fields](https://github.com/machinera-labs/machinera-python/blob/main/src/machinera/_types.py).
 `max_retries=n` allows `n + 1` attempts per replay-safe step, and `0` disables
 retries; pass `retry_policy=RetryPolicy(...)` instead for full control (supplying
-both raises `ValueError`). Polling has its own interval and count budget.
+both raises `ValueError`). Polling a pending job uses `poll_interval` (or a longer
+`Retry-After`) and continues until the call's deadline; the deadline you set is the
+only thing that ends it. `RetryPolicy.max_polls` is an optional hard cap on status
+reads, unset by default (see the
+[polling rule](https://github.com/machinera-labs/machinera-python/blob/main/api.md#retrypolicy)).
 
 Network failures, HTTP 429/502/503/504, and service refusals marked retryable are
 retried only when replaying the request is safe. Backoff is
@@ -285,7 +292,12 @@ Every SDK failure derives from `MachineraError`, and every API or transport fail
 from `APIError`. Local argument errors raise `ValueError` or `TypeError` before any
 request. `APIError` carries `status_code` (alias `status`), `code`, `retryable`,
 `request_id`, a sanitized `body`, and the recovery context `operation_key`,
-`job_id`, `upload_id`, `phase`, and `last_status`.
+`job_id`, `upload_id`, `phase`, and `last_status`. `str(error)` ends with
+`(request_id: …)` when the service returned a request ID; keep it when reporting a
+problem. `error.is_transient` is `True` when trying again later may succeed, and
+`RecoverableJobError` (the shared base of `DeadlineExceededError` and
+`TranscriptionInterrupted`) marks a call whose job may still be running; see
+[Batch and evaluation harnesses](#batch-and-evaluation-harnesses).
 
 HTTP failures raise `APIStatusError` subclasses (`BadRequestError`,
 `AuthenticationError`, `PermissionDeniedError`, `NotFoundError`, `ConflictError`,
@@ -306,6 +318,88 @@ Exceptions and their chains never contain service free text, raw HTTP objects,
 URLs, HTML, audio, or transcripts. Protect credentials, source URLs, operation
 keys, audio, and transcripts in your own logging; see [Logging](#logging) for the
 SDK's own records.
+
+## Batch and evaluation harnesses
+
+When transcribing many samples, for example to evaluate a dataset:
+
+- **Create one client per worker process** and share it across that worker's threads
+  (or tasks, with `AsyncMachinera`); bound in-flight calls with `max_concurrency`
+  instead of creating a client per call, so connections are reused.
+- **Derive one idempotency key per sample** from a stable sample identity, such as a
+  hash of the dataset name, sample ID, and options. After a crash or restart, the same
+  call with the same key replays the original submission and returns the same job
+  rather than starting a new one. Keys follow the
+  [reuse rules](#recover-an-interrupted-transcription).
+- **Choose the transport by input.** A keyed call is always a durable job, whatever
+  `transport` says; that suits long files and is what makes recovery after a restart
+  possible. `transcribe_url` always submits a durable job. For short files that you
+  would simply resubmit, an unkeyed call with the default `transport="auto"` can
+  finish in one synchronous request; `transport="job"` keeps unkeyed calls durable.
+  A durable job adds submission, queueing, and polling latency, so `"auto"` is faster
+  for short files while the service has capacity; when it does not, `"auto"` falls
+  back to a durable job by itself.
+- **Size `deadline` for the longest job you expect**, including queueing. Polling
+  continues until that deadline, so a long job is not cut short by a poll count;
+  adjust `RetryPolicy.poll_interval` to poll less often.
+- **Request `response_format="json"`** when you need only the text. `resume(job_id)`
+  defaults to `"verbose_json"`, so pass the same format there.
+- **Record `request_id`** from results and errors alongside each sample.
+
+Act on a failure with the first matching row:
+
+| Failure | Action |
+| --- | --- |
+| `TranscriptionInterrupted` | Stop; the same key or saved `job_id` continues after a restart. |
+| `RecoverableJobError` with `job_id` set | `resume(job_id)` with the same `response_format`. |
+| `RecoverableJobError` without `job_id` | Repeat the identical call with `idempotency_key=error.operation_key`; the job may have been accepted without its ID reaching you, and the key replays it. |
+| Any other `APIError` with `job_id` set and `is_transient` | `resume(job_id)` after a pause. |
+| `is_transient` | Repeat the identical call, with the same key, after a pause. |
+| Anything else | Record the sample as failed with `type(error).__name__`, `code`, and `request_id`. |
+
+```python
+import hashlib
+import time
+
+from machinera import (
+    APIError,
+    Machinera,
+    MachineraError,
+    RecoverableJobError,
+    TranscriptionInterrupted,
+)
+
+DEADLINE = 4 * 60 * 60  # longest expected job, in seconds
+
+
+def transcribe(client: Machinera, sample_id: str, path: str) -> str:
+    key = hashlib.sha256(f"my-eval:{sample_id}".encode()).hexdigest()
+    job_id = None
+    for attempt in range(3):
+        try:
+            if job_id is not None:
+                return client.resume(job_id, response_format="json", deadline=DEADLINE).text
+            return client.transcribe_file(
+                path,
+                model="transcribe-v1",
+                response_format="json",
+                idempotency_key=key,
+                deadline=DEADLINE,
+            ).text
+        except TranscriptionInterrupted:
+            raise
+        except MachineraError as error:
+            if isinstance(error, APIError) and error.job_id is not None:
+                job_id = error.job_id
+            if not (error.is_transient or isinstance(error, RecoverableJobError)):
+                raise
+            time.sleep(2**attempt)
+    raise RuntimeError(f"{sample_id}: attempts exhausted")
+
+
+with Machinera(max_concurrency=8) as client:
+    text = transcribe(client, "sample-0001", "sample-0001.wav")
+```
 
 ## Logging
 

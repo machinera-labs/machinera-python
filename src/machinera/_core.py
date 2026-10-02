@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import os
@@ -48,6 +49,7 @@ from ._exceptions import (
     TerminalJobError,
     UnprocessableEntityError,
     UploadError,
+    retry_eligible,
 )
 from ._files import FileContent, FileInput, unpack_file, validate_headers
 from ._logs import configure_from_env, logger
@@ -68,9 +70,18 @@ from ._types import (
 from ._uploads import Grant, descriptor, initialization_key, storage_code
 from ._version import __version__
 
-_REFUSAL_CODES = frozenset(
-    code for code, entry in ERROR_CODES.items() if entry.retryable and entry.status in (400, 408)
+# Synchronous admission refusals: the service accepted no work, so the body can be
+# submitted once as a durable job. Only codes the contract marks retryable qualify.
+_SYNC_FALLBACK_CODES = frozenset(
+    entry.code
+    for entry in (
+        _codes.inline_claim_timeout,
+        _codes.inline_admission_refused,
+        _codes.no_serving_capacity,
+    )
+    if entry.retryable
 )
+_SIZE_REFUSAL_CODES = (None, _codes.sync_size_cap.code, _codes.inline_body_over_cap.code)
 _PENDING_STATUSES = ("queued", "processing")
 _SECONDS = re.compile(r"[0-9]+(?:\.[0-9]*)?|\.[0-9]+")
 
@@ -93,6 +104,15 @@ def _seconds(value: str | None, scale: float) -> float | None:
         return None
     seconds = float(value) / scale
     return seconds if math.isfinite(seconds) else None
+
+
+def local_failure(error: OSError | httpx.HTTPError) -> APIConnectionError:
+    """Name the failure's class and errno, never its message, which may hold a path or URL."""
+    number = error.errno if isinstance(error, OSError) else None
+    detail = type(error).__name__ + (f", errno {number}" if type(number) is int else "")
+    failure = APIConnectionError(f"Local I/O or HTTP operation failed ({detail})")
+    failure._local = isinstance(error, OSError)
+    return failure
 
 
 def _path_template(path: str, storage: bool) -> str:
@@ -515,20 +535,8 @@ class Core:
                     )
                 else:
                     error = self._error(response)
-                eligible = (
-                    (
-                        replay_safe
-                        or response.status_code == 429
-                        or error.code
-                        in _REFUSAL_CODES
-                        | {
-                            _codes.input_busy.code,
-                            _codes.inline_admission_refused.code,
-                            _codes.no_serving_capacity.code,
-                        }
-                    )
-                    and error.retryable is True
-                    and (response.status_code not in (401, 403))
+                eligible = retry_eligible(
+                    response.status_code, error.code, error.retryable, replay_safe
                 )
             if isinstance(error, AmbiguousSubmissionError):
                 raise error
@@ -783,10 +791,12 @@ class Core:
         """Poll until completion, treating every status other than queued or processing as final.
 
         Statuses the service adds later are terminal states, so polling stops instead of
-        continuing until the deadline.
+        continuing until the deadline. Otherwise only the call deadline, enforced by
+        _wait, or an explicit max_polls ends polling.
         """
         observed: str | None = None
-        for _ in range(self.retry_policy.max_polls):
+        cap = self.retry_policy.max_polls
+        for _ in itertools.count() if cap is None else range(cap):
             data, response = yield from self._read_job(call)
             if data.status != observed:
                 observed = data.status
@@ -858,7 +868,7 @@ class Core:
             body = inline
             if not asynchronous:
                 call.phase = "sync_submit"
-                refusal: PayloadTooLargeError | None = None
+                refusal: APIStatusError | None = None
                 try:
                     response = yield from self._request(
                         call,
@@ -868,7 +878,7 @@ class Core:
                         headers=body.headers,
                         replay_safe=False,
                     )
-                except PayloadTooLargeError as error:
+                except APIStatusError as error:
                     refusal = error
                 if refusal is None:
                     data = (
@@ -877,11 +887,12 @@ class Core:
                         else self._json(response)
                     )
                     return self._result(call, data, response_format, response.status_code)
-                if refusal.code not in (
-                    None,
-                    _codes.sync_size_cap.code,
-                    _codes.inline_body_over_cap.code,
-                ):
+                sized = (
+                    isinstance(refusal, PayloadTooLargeError)
+                    and refusal.code in _SIZE_REFUSAL_CODES
+                )
+                unadmitted = refusal.code in _SYNC_FALLBACK_CODES and refusal.retryable is True
+                if not (sized or unadmitted):
                     raise refusal
             call.phase = "job_submit"
             response = yield from self._request(

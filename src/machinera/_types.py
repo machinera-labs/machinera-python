@@ -101,16 +101,17 @@ class RetryPolicy:
     max_attempts includes the initial request. Exponential backoff starts at
     initial_delay and is capped by max_delay before uniform jitter in [0.75, 1].
 
-    Retry-After is a minimum. poll_interval sets normal polling cadence; max_polls
-    bounds its separate count, subject to the overall deadline. HTTP transport
-    retries use the default of zero: https://www.python-httpx.org/advanced/transports/
+    Retry-After is a minimum. poll_interval sets normal polling cadence; polling ends
+    at the call's deadline, and max_polls, when set, is an additional hard cap on the
+    number of status reads. HTTP transport retries use the default of zero:
+    https://www.python-httpx.org/advanced/transports/
     """
 
     max_attempts: int = 3
     initial_delay: float = 0.5
     max_delay: float = 8
     poll_interval: float = 1
-    max_polls: int = 3600
+    max_polls: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.max_attempts) is not int or self.max_attempts < 1:
@@ -119,8 +120,8 @@ class RetryPolicy:
             positive(getattr(self, name), name)
         if self.initial_delay > self.max_delay:
             raise ValueError("delays must satisfy initial_delay <= max_delay")
-        if type(self.max_polls) is not int or self.max_polls < 1:
-            raise ValueError("max_polls must be a positive integer")
+        if self.max_polls is not None and (type(self.max_polls) is not int or self.max_polls < 1):
+            raise ValueError("max_polls must be None or a positive integer")
 
 
 STAGED_UPLOAD_THRESHOLD_BYTES = 50 * 1024 * 1024

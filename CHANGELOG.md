@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+## 0.1.1 — 2026-10-02
+
+### Changed
+
+- Polling a pending job now continues until the call's deadline; a deadline you set
+  is the only thing that ends it. `RetryPolicy.max_polls` is now `int | None` and
+  defaults to `None` (no count limit); a positive value remains a hard cap on status
+  reads. Previously the default count cap could end a long job's polling with
+  `DeadlineExceededError` well before a longer `deadline`.
+- With `transport="auto"`, a synchronous request refused before any work was admitted
+  (`inline_claim_timeout`, `inline_admission_refused`, or `no_serving_capacity`, when
+  retryable) is submitted once as a durable job with the same body, operation key,
+  and deadline instead of raising. Ambiguous and non-retryable failures never fall
+  back.
+- `str(error)` for an `APIError` ends with `(request_id: …)` when the request ID is
+  known; `message` and `args` are unchanged.
+
+### Added
+
+- `RecoverableJobError`, the shared base of `DeadlineExceededError` and
+  `TranscriptionInterrupted`, whose `job_id` names the job to resume, or is `None` when
+  no job ID was observed; then repeat the call with the same operation key.
+- `MachineraError.is_transient`, which is `True` when trying again later may succeed.
+  It follows the same rule as the SDK's automatic retries, so it is never `True` for a
+  response the SDK would not retry.
+- A "Batch and evaluation harnesses" guide in the README.
+- Homepage and Documentation project URLs and package keywords.
+
+### Fixed
+
+- Local I/O failures raised as `APIConnectionError` name the original exception class
+  and `errno` in the message, without the file path.
+
 ## 0.1.0 — 2026-10-02
 
 ### Added

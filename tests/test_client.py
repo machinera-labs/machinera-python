@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import inspect
 import io
@@ -31,10 +32,10 @@ from machinera import (
     InternalServerError,
     Limits,
     Machinera,
-    MachineraError,
     PayloadTooLargeError,
     PermissionDeniedError,
     RateLimitError,
+    RecoverableJobError,
     RetryPolicy,
     TerminalJobError,
     TimeoutPolicy,
@@ -695,12 +696,132 @@ def test_path_input_preserves_suffix(tmp_path: Path, suffix: str) -> None:
     assert path.read_bytes() == b"audio"
 
 
-def test_sanitizes_local_file_error() -> None:
-    with client(lambda _: completed()) as sdk:
-        with pytest.raises(MachineraError) as caught:
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_sanitizes_local_file_error(asynchronous: bool) -> None:
+    with client(lambda _: completed(), asynchronous=asynchronous) as sdk:
+        with pytest.raises(APIConnectionError) as caught:
             sdk.transcribe_file("/missing/private-file.wav", model=MODEL, content_type="audio/wav")
-    assert "private-file" not in str(caught.value)
+    assert "private-file" not in str(caught.value) and "/missing" not in str(caught.value)
+    assert str(caught.value).endswith(f"(FileNotFoundError, errno {errno.ENOENT})")
+    assert caught.value.is_transient is False
     assert caught.value.__context__ is None and caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_unreadable_handle_is_not_transient(asynchronous: bool) -> None:
+    class Unreadable(io.BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            raise OSError(errno.EIO, "private detail")
+
+    with client(lambda _: completed(), asynchronous=asynchronous) as sdk:
+        with pytest.raises(APIConnectionError) as caught:
+            sdk.transcribe_file(Unreadable(b"audio"), model=MODEL, content_type="audio/wav")
+    assert str(caught.value).endswith(f"(OSError, errno {errno.EIO})")
+    assert "private" not in str(caught.value) and caught.value.is_transient is False
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_exhausted_connection_retries_are_transient(asynchronous: bool) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("unavailable")
+
+    with client(handler, asynchronous=asynchronous) as sdk:
+        with pytest.raises(APIConnectionError) as caught:
+            sdk.transcribe_url("https://audio.example/a", model=MODEL)
+    assert caught.value.retryable is True and caught.value.is_transient is True
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "status,error,kind,transient",
+    [
+        (429, {"retryable": False}, RateLimitError, False),
+        (429, {"retryable": True}, RateLimitError, True),
+        (401, {"code": "invalid_api_key", "retryable": True}, AuthenticationError, False),
+        (403, {"code": "api_key_forbidden", "retryable": True}, PermissionDeniedError, False),
+        (503, {"retryable": True}, InternalServerError, True),
+        (503, {"retryable": False}, InternalServerError, False),
+    ],
+)
+def test_is_transient_matches_the_retry_decision(
+    status: int,
+    error: dict[str, Any],
+    kind: type[APIStatusError],
+    transient: bool,
+    asynchronous: bool,
+) -> None:
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(status, json={"error": error})
+
+    with client(handler, asynchronous=asynchronous) as sdk:
+        with pytest.raises(kind) as caught:
+            sdk.transcribe_url("https://audio.example/a", model=MODEL)
+    retried = len(requests) == RetryPolicy().max_attempts
+    assert caught.value.is_transient is transient is retried
+    assert len(requests) == (RetryPolicy().max_attempts if transient else 1)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("code,transient", [("input_busy", True), ("service_unavailable", False)])
+def test_sync_phase_refusal_transience_follows_replay_safety(
+    code: str, transient: bool, asynchronous: bool
+) -> None:
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(503, json={"error": {"code": code, "retryable": True}})
+
+    with client(handler, asynchronous=asynchronous) as sdk:
+        with pytest.raises(InternalServerError) as caught:
+            sdk.transcribe_file(io.BytesIO(b"audio"), model=MODEL, content_type="audio/wav")
+    assert caught.value.phase == "sync_submit" and caught.value.is_transient is transient
+    assert len(requests) == (RetryPolicy().max_attempts if transient else 1)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_deadline_before_job_id_is_recovered_with_the_same_key(asynchronous: bool) -> None:
+    clock = Clock()
+    lost = True
+    keys = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            keys.append(request.headers["idempotency-key"])
+            if lost:
+                clock.now += 6
+                raise httpx.ReadTimeout("response lost after admission")
+            return httpx.Response(202, json={"id": "job-1", "status": "queued"})
+        return completed()
+
+    with client(handler, clock, asynchronous=asynchronous) as sdk:
+        with pytest.raises(DeadlineExceededError) as caught:
+            sdk.transcribe_url("https://audio.example/a", model=MODEL, deadline=10)
+        error = caught.value
+        assert isinstance(error, RecoverableJobError) and error.job_id is None
+        assert error.phase == "job_submit" and error.is_transient is False
+        lost = False
+        output = sdk.transcribe_url(
+            "https://audio.example/a", model=MODEL, idempotency_key=error.operation_key
+        )
+    assert output.job_id == "job-1" and set(keys) == {error.operation_key}
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_interrupt_before_job_id_keeps_the_operation_key(asynchronous: bool) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise KeyboardInterrupt
+
+    with client(handler, asynchronous=asynchronous) as sdk:
+        with pytest.raises(TranscriptionInterrupted) as caught:
+            sdk.transcribe_url("https://audio.example/a", model=MODEL, idempotency_key="key-1")
+    error = caught.value
+    assert isinstance(error, RecoverableJobError) and error.job_id is None
+    assert error.operation_key == "key-1" and error.phase == "job_submit"
+    assert error.ambiguous is False and error.is_transient is False
 
 
 def test_late_admission_response_keeps_recovery_id() -> None:
@@ -752,6 +873,110 @@ def test_forced_job_transport_with_injected_client() -> None:
     assert paths[0] == "/v1/transcription_jobs"
 
 
+UNADMITTED = ["inline_claim_timeout", "inline_admission_refused", "no_serving_capacity"]
+
+
+def refused(code: str, retryable: bool = True) -> httpx.Response:
+    return httpx.Response(
+        503, json={"error": {"code": code, "retryable": retryable}}, headers={"x-request-id": "r-1"}
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("code", UNADMITTED)
+def test_auto_sync_admission_refusal_falls_back_to_job(code: str, asynchronous: bool) -> None:
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/audio/transcriptions":
+            return refused(code)
+        if request.method == "POST":
+            return httpx.Response(202, json={"id": "job-1", "status": "queued"})
+        return completed()
+
+    with client(handler, asynchronous=asynchronous) as sdk:
+        output = sdk.transcribe_file(io.BytesIO(b"audio"), model=MODEL, content_type="audio/wav")
+    sync = [r for r in requests if r.url.path == "/v1/audio/transcriptions"]
+    submit = [r for r in requests if r.url.path == "/v1/transcription_jobs"]
+    assert output.job_id == "job-1" and len(submit) == 1
+    assert len(sync) == (1 if code == "inline_claim_timeout" else RetryPolicy().max_attempts)
+    assert all(r.content == submit[0].content for r in sync)
+    assert submit[0].headers["idempotency-key"]
+    assert requests[-1].url.path == "/v1/transcription_jobs/job-1"
+
+
+@pytest.mark.parametrize("code", UNADMITTED)
+def test_job_fallback_keeps_the_call_deadline(code: str) -> None:
+    clock = Clock()
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/audio/transcriptions":
+            clock.now += 4
+            return refused(code)
+        if request.method == "POST":
+            return httpx.Response(202, json={"id": "job-1", "status": "queued"})
+        return httpx.Response(200, json={"id": "job-1", "status": "queued"})
+
+    retry = RetryPolicy(max_attempts=1)
+    with client(handler, clock, retry_policy=retry) as sdk:
+        with pytest.raises(DeadlineExceededError) as caught:
+            sdk.transcribe_file(
+                io.BytesIO(b"audio"), model=MODEL, content_type="audio/wav", deadline=10
+            )
+    assert caught.value.job_id == "job-1" and caught.value.phase == "poll"
+    assert clock.now < 10 and caught.value.operation_key == requests[1].headers["idempotency-key"]
+
+
+def lost(_: httpx.Request) -> httpx.Response:
+    raise httpx.ReadError("lost")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "handler,kind",
+    [
+        (lambda _: refused("inline_claim_timeout", retryable=False), InternalServerError),
+        (lambda _: refused("service_unavailable"), InternalServerError),
+        (lost, AmbiguousSubmissionError),
+    ],
+)
+def test_no_job_fallback_unless_admission_refused(
+    handler: Callable[[httpx.Request], httpx.Response], kind: type[Exception], asynchronous: bool
+) -> None:
+    paths = []
+
+    def record(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return handler(request)
+
+    with client(record, asynchronous=asynchronous) as sdk:
+        with pytest.raises(kind) as caught:
+            sdk.transcribe_file(io.BytesIO(b"audio"), model=MODEL, content_type="audio/wav")
+    assert caught.value.job_id is None  # type: ignore[attr-defined]
+    assert paths and set(paths) == {"/v1/audio/transcriptions"}
+
+
+@pytest.mark.parametrize("code", UNADMITTED)
+def test_job_transport_never_tries_sync(code: str) -> None:
+    paths = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/v1/audio/transcriptions":
+            return refused(code)
+        if request.method == "POST":
+            return httpx.Response(202, json={"id": "job-1", "status": "queued"})
+        return completed()
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        with Machinera(api_key=CREDENTIAL, base_url=API, transport="job", http_client=http) as sdk:
+            sdk.transcribe_file(io.BytesIO(b"audio"), model=MODEL, content_type="audio/wav")
+    assert paths == ["/v1/transcription_jobs", "/v1/transcription_jobs/job-1"]
+
+
 @pytest.mark.parametrize("status,code", [(429, None), (503, "input_busy")])
 def test_sync_definitive_refusal_retries_same_transport(status: int, code: str | None) -> None:
     requests = []
@@ -788,6 +1013,57 @@ def test_poll_budget_exhaustion_keeps_job() -> None:
     assert len(requests) == 2 and caught.value.job_id == "job-1"
 
 
+def queued(_: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={"id": "job-1", "status": "queued"})
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_deadline_alone_ends_polling(asynchronous: bool) -> None:
+    clock = Clock()
+    polls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal polls
+        polls += 1
+        return completed() if polls == 5000 else queued(request)
+
+    seconds = RetryPolicy(poll_interval=1)
+    with client(handler, clock, asynchronous=asynchronous, retry_policy=seconds) as sdk:
+        assert sdk.resume("job-1", deadline=4 * 3600).job_id == "job-1"
+    assert polls == 5000 and clock.now == 4999
+
+
+def test_long_deadline_polls_until_it_expires() -> None:
+    clock = Clock()
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return queued(request)
+
+    with client(handler, clock, retry_policy=RetryPolicy(poll_interval=10)) as sdk:
+        with pytest.raises(DeadlineExceededError) as caught:
+            sdk.resume("job-1", deadline=4 * 3600)
+    assert len(requests) == 4 * 360 and clock.now < 4 * 3600
+    assert caught.value.job_id == "job-1" and caught.value.is_transient
+
+
+def test_default_deadline_ends_polling_without_explicit_deadline() -> None:
+    clock = Clock()
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return queued(request)
+
+    with client(handler, clock, retry_policy=RetryPolicy(poll_interval=1)) as sdk:
+        with pytest.raises(DeadlineExceededError) as caught:
+            sdk.resume("job-1")
+    budget = TimeoutPolicy().deadline
+    assert len(requests) == budget and budget - 1 <= clock.now < budget
+    assert caught.value.job_id == "job-1"
+
+
 def test_close_waits_for_active_calls() -> None:
     entered = threading.Event()
     release = threading.Event()
@@ -816,8 +1092,9 @@ def test_close_waits_for_active_calls() -> None:
         assert running.result(timeout=5).job_id == "job-1"
         closer.result(timeout=5)
     assert closed.is_set() and sdk._http.is_closed
-    with pytest.raises(APIConnectionError, match="closed"):
+    with pytest.raises(APIConnectionError, match="closed") as caught:
         sdk.resume("job-1")
+    assert caught.value.is_transient is False
 
 
 def test_streaming_reads_are_bounded_and_offset_restored() -> None:

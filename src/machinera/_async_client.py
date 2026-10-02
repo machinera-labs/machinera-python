@@ -10,7 +10,19 @@ from typing import Any, BinaryIO, Literal, cast
 
 import httpx
 
-from ._core import _P, _T, CloseFile, Core, Flow, OpenFile, Prepare, Send, Sleep, _Call
+from ._core import (
+    _P,
+    _T,
+    CloseFile,
+    Core,
+    Flow,
+    OpenFile,
+    Prepare,
+    Send,
+    Sleep,
+    _Call,
+    local_failure,
+)
 from ._exceptions import (
     APIConnectionError,
     APIError,
@@ -172,6 +184,7 @@ class AsyncMachinera(Core):
         life = self._lifecycle
         if life.closed:
             error = APIConnectionError("Client is closed")
+            error._local = True
             self._attach(error, call)
             raise error
         life.active += 1
@@ -201,8 +214,8 @@ class AsyncMachinera(Core):
                 "Transcription interrupted; use recovery context",
                 ambiguous=key is None and call.phase == "sync_submit",
             )
-        except (OSError, httpx.HTTPError):
-            failure = APIConnectionError("Local I/O or HTTP operation failed")
+        except (OSError, httpx.HTTPError) as local:
+            failure = local_failure(local)
         finally:
             if acquired and life.semaphore is not None:
                 life.semaphore.release()

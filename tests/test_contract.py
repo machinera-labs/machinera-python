@@ -152,7 +152,7 @@ def test_retry_expansion(options: dict[str, Any], attempts: int) -> None:
             sdk.get_job("job-1")
         assert sdk.retry_policy.max_attempts == attempts
         if not options:
-            assert sdk.retry_policy == m.RetryPolicy(3, 0.5, 8, 1, 3600)
+            assert sdk.retry_policy == m.RetryPolicy(3, 0.5, 8, 1, None)
         assert sdk.limits == m.Limits(25 * 1024**2, 50 * 1024**2, 64 * 1024)
     assert len(calls) == attempts and caught.value.retryable is True
 
@@ -317,13 +317,126 @@ def test_status_errors_and_safe_body(status: int, kind: type[m.APIStatusError]) 
             sdk.get_job("job-1")
     error = caught.value
     assert type(error) is kind and error.status_code == error.status == status
-    assert error.message == str(error) and error.retryable is False
+    assert str(error) == error.message + " (request_id: request-1)" and error.retryable is False
     assert error.body == {"code": "test_code", "retryable": False, "job_id": "job-1"}
     assert error.request_id == "request-1" and error.job_id == "job-1"
     assert error.__context__ is error.__cause__ is None
     assert not hasattr(error, "request") and not hasattr(error, "response")
     with pytest.raises(AttributeError):
         error.status = 200
+
+
+@pytest.mark.parametrize(
+    "error,transient",
+    [
+        (m.APIConnectionError("x"), True),
+        (m.APITimeoutError("x", retryable=True), True),
+        (m.APIConnectionError("x", retryable=False), False),
+        (m.APIConnectionError("x", phase="sync_submit"), False),
+        (m.APIConnectionError("x", retryable=True, phase="sync_submit"), True),
+        (m.RateLimitError("x", status_code=429, retryable=True), True),
+        (m.RateLimitError("x", status_code=429, retryable=True, phase="sync_submit"), True),
+        (m.RateLimitError("x", status_code=429, retryable=False), False),
+        (m.RateLimitError("x", status_code=429), False),
+        (m.InternalServerError("x", status_code=503, retryable=True), True),
+        (m.BadRequestError("x", status_code=400, retryable=True), True),
+        (m.APIStatusError("x", status_code=418, retryable=True), True),
+        (m.AuthenticationError("x", status_code=401, retryable=True), False),
+        (m.PermissionDeniedError("x", status_code=403, retryable=True), False),
+        (
+            m.InternalServerError(
+                "x",
+                status_code=503,
+                code="no_serving_capacity",
+                retryable=True,
+                phase="sync_submit",
+            ),
+            True,
+        ),
+        (
+            m.InternalServerError(
+                "x", status_code=503, code="input_busy", retryable=True, phase="sync_submit"
+            ),
+            True,
+        ),
+        (
+            m.InternalServerError(
+                "x",
+                status_code=503,
+                code="no_serving_capacity",
+                retryable=False,
+                phase="sync_submit",
+            ),
+            False,
+        ),
+        (m.InternalServerError("x", status_code=503, retryable=True, phase="sync_submit"), False),
+        (m.InternalServerError("x", status_code=503, retryable=False), False),
+        (m.InternalServerError("x", status_code=503), False),
+        (m.DeadlineExceededError("x", job_id="job-1"), True),
+        (m.DeadlineExceededError("x"), False),
+        (m.TranscriptionInterrupted("x", job_id="job-1"), True),
+        (m.TranscriptionInterrupted("x", ambiguous=True), False),
+        (m.AmbiguousSubmissionError("x", job_id="job-1"), False),
+        (m.TerminalJobError("x", retryable=True, job_id="job-1"), False),
+        (m.TerminalIntegrityError("x", job_id="job-1"), False),
+        (m.UploadError("x", retryable=True), False),
+        (m.APIResponseValidationError("x"), False),
+        (m.APIError("x", retryable=True), False),
+        (m.MachineraError("x"), False),
+    ],
+)
+def test_is_transient_matrix(error: m.MachineraError, transient: bool) -> None:
+    assert error.is_transient is transient
+
+
+@pytest.mark.parametrize(
+    "cause,transient",
+    [
+        (FileNotFoundError(2, "missing"), False),
+        (PermissionError(13, "denied"), False),
+        (httpx.ReadError("reset"), True),
+    ],
+)
+def test_local_failures_are_not_transient(cause: Exception, transient: bool) -> None:
+    from machinera._core import local_failure
+
+    error = local_failure(cause)  # type: ignore[arg-type]
+    assert isinstance(error, m.APIConnectionError) and error.is_transient is transient
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_closed_client_is_not_transient(asynchronous: bool) -> None:
+    with client(lambda _: completed(), asynchronous=asynchronous) as sdk:
+        sdk.aclose() if asynchronous else sdk.close()
+        with pytest.raises(m.APIConnectionError, match="closed") as caught:
+            sdk.get_job("job-1")
+    assert caught.value.is_transient is False
+
+
+def test_recoverable_job_errors_share_one_marker() -> None:
+    recoverable = (m.DeadlineExceededError, m.TranscriptionInterrupted)
+    for cls in recoverable:
+        assert issubclass(cls, m.RecoverableJobError) and issubclass(cls, m.APIError)
+        assert cls("x").job_id is None and cls("x", job_id="job-1").job_id == "job-1"
+    assert issubclass(m.TranscriptionInterrupted, KeyboardInterrupt)
+    assert issubclass(m.RecoverableJobError, m.MachineraError)
+    for name in m.__all__:
+        value = getattr(m, name)
+        if isinstance(value, type) and issubclass(value, m.RecoverableJobError):
+            assert value in (m.RecoverableJobError, *recoverable), name
+    with pytest.raises(m.RecoverableJobError) as caught:
+        raise m.TranscriptionInterrupted("stopped", job_id="job-1")
+    assert caught.value.job_id == "job-1"
+
+
+def test_request_id_suffix_only_when_known() -> None:
+    error = m.APIStatusError("Request failed")
+    assert str(error) == "Request failed" == error.message
+    error.request_id = "request-2"
+    assert str(error) == "Request failed (request_id: request-2)"
+    assert error.message == "Request failed" and error.args == ("Request failed",)
+    interrupted = m.TranscriptionInterrupted("stopped", request_id="request-3")
+    assert str(interrupted) == "stopped (request_id: request-3)"
 
 
 def test_non_json_and_local_size_metadata() -> None:
