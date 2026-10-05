@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import itertools
 import json
 import math
@@ -9,12 +11,13 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from functools import wraps
 from types import MappingProxyType
-from typing import Any, BinaryIO, ClassVar, Literal, ParamSpec, TypeVar
+from typing import Any, BinaryIO, ClassVar, Literal, ParamSpec, TypeVar, cast, get_args
 from urllib.parse import quote
 
 import httpx
@@ -33,7 +36,6 @@ from ._exceptions import (
     AmbiguousSubmissionError,
     APIConnectionError,
     APIError,
-    APIResponseValidationError,
     APIStatusError,
     APITimeoutError,
     AuthenticationError,
@@ -48,9 +50,13 @@ from ._exceptions import (
     RateLimitError,
     TerminalIntegrityError,
     TerminalJobError,
+    TranscriptionInterrupted,
     UnprocessableEntityError,
     UploadError,
     connection_replayable,
+    expired_upload,
+    explicit_guidance,
+    invalid_response,
     retry_eligible,
 )
 from ._files import FileContent, FileInput, unpack_file, validate_headers
@@ -69,7 +75,7 @@ from ._types import (
     positive,
     resolve_timeout,
 )
-from ._uploads import Grant, descriptor, initialization_key, storage_code
+from ._uploads import Grant, UploadPhase, descriptor, initialization_key, storage_code
 from ._version import __version__
 
 _SIZE_REFUSAL_CODES = (None, _codes.sync_size_cap.code, _codes.inline_body_over_cap.code)
@@ -116,17 +122,38 @@ _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
 
+class _Interrupt(Exception):
+    """Carry keyboard interruption through child tasks without stopping the event loop."""
+
+
+@contextmanager
+def _sanitize_errors() -> Iterator[None]:
+    failure: APIError | ValueError | TypeError
+    try:
+        yield
+    except (APIError, ValueError, TypeError) as error:
+        failure = error
+    else:
+        return
+    failure.__context__ = None
+    failure.__cause__ = None
+    raise failure from None
+
+
 def _sanitized(function: Callable[_P, _T]) -> Callable[_P, _T]:
+    if inspect.iscoroutinefunction(function):
+
+        @wraps(function)
+        async def invoke_async(*args: _P.args, **kwargs: _P.kwargs) -> Any:
+            with _sanitize_errors():
+                return await function(*args, **kwargs)
+
+        return cast(Callable[_P, _T], invoke_async)
+
     @wraps(function)
     def invoke(*args: _P.args, **kwargs: _P.kwargs) -> _T:
-        failure: APIError | ValueError | TypeError
-        try:
+        with _sanitize_errors():
             return function(*args, **kwargs)
-        except (APIError, ValueError, TypeError) as error:
-            failure = error
-        failure.__context__ = None
-        failure.__cause__ = None
-        raise failure from None
 
     return invoke
 
@@ -146,6 +173,12 @@ class _Call:
     last_status: str | None = None
     file_released: threading.Event | None = None
     read_idle: threading.Event | None = None
+    # True when the caller supplied the key of a submitting call, False when the SDK
+    # generated it, None for calls that never submit under it.
+    caller_key: bool | None = None
+    # True once a job submission was sent and its response lost: the service may have
+    # accepted a job whose ID the SDK never saw.
+    submission_lost: bool = False
 
     def remaining(self) -> float:
         remaining = self.end - self.clock()
@@ -193,13 +226,16 @@ Flow = Generator[Effect, Any, _T]
 
 
 # A deadline cancels an upload or submission by shutting down its socket, so that pool
-# keeps no idle connection that could be reused afterwards.
-EXCHANGE_POOL = httpx.Limits(max_connections=100, max_keepalive_connections=0, keepalive_expiry=5)
-# Job status polls are small GETs that reuse connections; httpx's DEFAULT_LIMITS values.
-POLL_POOL = httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=5)
+# keeps no idle connection that could be reused afterwards. Both pools are shared by
+# every client in the process, so neither caps total connections; max_concurrency
+# bounds each client.
+EXCHANGE_POOL = httpx.Limits(max_connections=None, max_keepalive_connections=0, keepalive_expiry=5)
+# Job status polls are small GETs that reuse connections; keep-alive values are httpx's
+# DEFAULT_LIMITS.
+POLL_POOL = httpx.Limits(max_connections=None, max_keepalive_connections=20, keepalive_expiry=5)
 
 
-@dataclass(frozen=True, init=False, repr=False)
+@dataclass(frozen=True, init=False, repr=False, eq=False)
 class Core:
     """Shared protocol state machine; drivers execute yielded I/O effects."""
 
@@ -230,9 +266,9 @@ class Core:
         retry_policy: RetryPolicy | None = None,
         limits: Limits | None = None,
         max_concurrency: int | None = None,
-        transport: Any = "auto",
+        transport: Literal["auto", "job"] | httpx.BaseTransport | httpx.AsyncBaseTransport = "auto",
         sync_replay: str = "never",
-        http_client: Any = None,
+        http_client: httpx.Client | httpx.AsyncClient | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         random_source: Callable[[], float] = random.random,
@@ -297,28 +333,26 @@ class Core:
         for name, value in settings.items():
             object.__setattr__(self, name, value)
 
-        def owned(limits: httpx.Limits, pool: Any = None) -> Any:
+        def owned(role: str) -> Any:
+            # Cheap wrappers: the shared pool and its TLS context are created on first use.
             return self._client_type(
-                transport=transport if injected else pool,
+                transport=transport if injected else self._shared_transport(role),
                 timeout=None,
                 follow_redirects=False,
                 trust_env=False,
-                limits=limits,
             )
 
-        http = http_client or owned(EXCHANGE_POOL)
+        http = http_client or owned("exchange")
         object.__setattr__(self, "_http", http)
         object.__setattr__(
             self,
             "_poll_http",
-            http
-            if http_client is not None or injected
-            else owned(POLL_POOL, self._poll_transport(POLL_POOL)),
+            http if http_client is not None or injected else owned("poll"),
         )
         object.__setattr__(self, "_owns_http", http_client is None)
 
-    def _poll_transport(self, limits: httpx.Limits) -> Any:
-        return None
+    def _shared_transport(self, role: str) -> Any:
+        raise NotImplementedError
 
     def _safe_token(self, value: Any) -> str | None:
         token = _token(value)
@@ -480,6 +514,8 @@ class Core:
                 unsent = isinstance(
                     exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
                 )
+                if not unsent and method == "POST" and path == "/transcription_jobs":
+                    call.submission_lost = True
                 if connection_replayable(unsent, replay_safe, replay_after_send):
                     cls = (
                         APITimeoutError
@@ -538,6 +574,7 @@ class Core:
                     error.retryable,
                     replay_safe,
                     replay_after_send,
+                    explicit_guidance(error.body),
                 )
             if isinstance(error, AmbiguousSubmissionError):
                 raise error
@@ -594,10 +631,9 @@ class Core:
         data = self._json(response)
         upload_id = self._safe_token(data.get("upload_id"))
         if response.status_code not in (200, 201) or upload_id is None:
-            raise APIResponseValidationError(
+            raise invalid_response(
                 "Invalid upload initialization response",
                 status_code=response.status_code,
-                retryable=False,
             )
         if call.upload_id is not None and upload_id != call.upload_id:
             raise UploadError("Upload replay returned a different identifier", retryable=False)
@@ -609,11 +645,7 @@ class Core:
         if grant.state == "bound":
             self._queued(call, data.get("job_id"))
         if grant.state in ("expired", "reclaimed"):
-            raise UploadError(
-                "Upload has expired; recover any accepted job",
-                code=_codes.upload_expired.code,
-                retryable=False,
-            )
+            raise expired_upload()
         size = expected["size_bytes"]
         assert isinstance(size, int)
         if grant.state == "pending" and size > grant.limits["max_upload_bytes"]:
@@ -628,11 +660,7 @@ class Core:
             if grant.state != "pending":
                 return None
             if self._wall_clock() >= grant.upload_expires_at:
-                raise UploadError(
-                    "Upload has expired; recover any accepted job",
-                    code=_codes.upload_expired.code,
-                    retryable=False,
-                )
+                raise expired_upload()
             if self._wall_clock() >= grant.expires_at:
                 yield from self._initialize(call, expected)
                 grant = call.grant
@@ -641,9 +669,7 @@ class Core:
                 if grant.state != "pending":
                     return None
                 if self._wall_clock() >= min(grant.expires_at, grant.upload_expires_at):
-                    raise UploadError(
-                        "Upload grant has expired", code=_codes.upload_expired.code, retryable=False
-                    )
+                    raise expired_upload("Upload grant has expired")
             assert grant.put_url is not None
             return (grant.put_url, grant.headers)
 
@@ -719,9 +745,7 @@ class Core:
     def _json(self, response: httpx.Response) -> dict[str, Any]:
         data = _body(response)
         if not isinstance(data, dict):
-            raise APIResponseValidationError(
-                "Invalid JSON response", status_code=response.status_code, retryable=False
-            )
+            raise invalid_response("Invalid JSON response", status_code=response.status_code)
         return data
 
     def _result(
@@ -739,8 +763,8 @@ class Core:
                 else TranscriptionResult.model_validate(data)
             )
         except ValidationError:
-            raise APIResponseValidationError(
-                "Invalid transcription result response", status_code=status_code, retryable=False
+            raise invalid_response(
+                "Invalid transcription result response", status_code=status_code
             ) from None
         return result.model_copy(
             update={
@@ -761,8 +785,8 @@ class Core:
         call.job_id = self._safe_token(data.get("id"))
         call.last_status = "queued"
         if response.status_code != 202 or call.job_id is None:
-            raise APIResponseValidationError(
-                "Invalid job admission response", status_code=response.status_code, retryable=False
+            raise invalid_response(
+                "Invalid job admission response", status_code=response.status_code
             )
         call.remaining()
 
@@ -773,9 +797,7 @@ class Core:
             call, "GET", "/transcription_jobs/" + quote(call.job_id, safe="")
         )
         data = self._json(response)
-        invalid = APIResponseValidationError(
-            "Invalid job status response", status_code=response.status_code, retryable=False
-        )
+        invalid = invalid_response("Invalid job status response", status_code=response.status_code)
         try:
             snapshot = JobSnapshot.model_validate(data)
         except ValidationError:
@@ -805,10 +827,9 @@ class Core:
             if data.status == "completed":
                 result = data.result
                 if result is None:
-                    raise APIResponseValidationError(
+                    raise invalid_response(
                         "Job response did not contain a result",
                         status_code=response.status_code,
-                        retryable=False,
                     )
                 return self._result(call, result, response_format, response.status_code)
             if data.status not in _PENDING_STATUSES:
@@ -981,6 +1002,41 @@ class Core:
             raise ValueError("Invalid job identifier")
         return token
 
+    def _closed_error(self, call: _Call) -> APIConnectionError:
+        error = APIConnectionError("Client is closed")
+        error._local = True
+        self._attach(error, call)
+        return error
+
+    def _classify(
+        self, error: BaseException, call: _Call, key: str | None, *, blocking: bool = False
+    ) -> BaseException | None:
+        if isinstance(error, APIError):
+            return error
+        if isinstance(error, (ValueError, TypeError)):
+            if call.phase not in get_args(UploadPhase):
+                return None
+            if blocking:
+                for name, value in (
+                    ("operation_key", call.operation_key),
+                    ("upload_id", call.upload_id),
+                    ("phase", call.phase),
+                    ("job_id", call.job_id),
+                ):
+                    setattr(error, name, value)
+                return None
+            return error
+        if isinstance(error, KeyboardInterrupt) or (not blocking and isinstance(error, _Interrupt)):
+            return TranscriptionInterrupted(
+                "Transcription interrupted; use recovery context",
+                ambiguous=key is None and call.phase == "sync_submit",
+            )
+        if isinstance(error, (OSError, httpx.HTTPError)):
+            return local_failure(error)
+        if not blocking and isinstance(error, asyncio.CancelledError):
+            return error
+        return None
+
     def _new_call(
         self,
         timeout: Timeout,
@@ -990,6 +1046,7 @@ class Core:
         phase: str = "prepare",
         upload_id: str | None = None,
         job_id: str | None = None,
+        caller_key: bool | None | Unset = UNSET,
     ) -> _Call:
         start = self._clock()
         policy = resolve_timeout(timeout, self.timeout)
@@ -1006,6 +1063,7 @@ class Core:
             phase=phase,
             upload_id=upload_id,
             job_id=job_id,
+            caller_key=key is not None if isinstance(caller_key, Unset) else caller_key,
         )
 
     def _attach(self, error: BaseException, call: _Call) -> None:
@@ -1015,5 +1073,7 @@ class Core:
         error.__cause__ = None
         if isinstance(error, APIError):
             error._sync_replay = self.sync_replay == "always"
+            error._caller_key = call.caller_key
+            error._submission_lost = call.submission_lost
             error.request_id = error.request_id or call.request_id
             error._file_released = call.file_released

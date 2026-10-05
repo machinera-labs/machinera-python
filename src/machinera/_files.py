@@ -16,27 +16,29 @@ FileInput = (
     | tuple[str | None, FileContent, str | None]
     | tuple[str | None, FileContent, str | None, Mapping[str, str]]
 )
-_MIME_SUFFIXES = {
-    "audio/wav": "wav",
-    "audio/x-wav": "wav",
-    "audio/flac": "flac",
-    "audio/x-flac": "flac",
-    "audio/ogg": "ogg",
-    "application/ogg": "ogg",
-    "audio/mpeg": "mp3",
-    "audio/mp4": "m4a",
-    "audio/x-m4a": "m4a",
-    "video/mp4": "mp4",
-    "audio/webm": "webm",
-    "video/webm": "webm",
+_MEDIA_TYPES = {
+    ("wav",): ("audio/wav", "audio/x-wav"),
+    ("flac",): ("audio/flac", "audio/x-flac"),
+    ("ogg",): ("audio/ogg", "application/ogg"),
+    ("mp3", "mpga", "mpeg"): ("audio/mpeg",),
+    ("m4a",): ("audio/mp4", "audio/x-m4a"),
+    ("mp4",): ("video/mp4",),
+    ("webm",): ("audio/webm", "video/webm"),
 }
-_RESERVED = {
+_MIME_SUFFIXES = {mime: suffixes[0] for suffixes, mimes in _MEDIA_TYPES.items() for mime in mimes}
+_SUFFIX_MIME_TYPES = {f".{s}": m[0] for suffixes, m in _MEDIA_TYPES.items() for s in suffixes}
+_SENSITIVE_HEADERS = {
     "authorization",
     "host",
+    "transfer-encoding",
+    "cookie",
+    "cookie2",
+    "proxy-authorization",
+}
+_RESERVED = (_SENSITIVE_HEADERS - {"cookie", "cookie2", "proxy-authorization"}) | {
     "content-length",
     "content-type",
     "idempotency-key",
-    "transfer-encoding",
     "x-content-md5",
 }
 
@@ -45,18 +47,21 @@ def printable(value: str) -> bool:
     return all(32 <= ord(c) <= 126 for c in value)
 
 
-def header_name(name: object) -> bool:
-    return isinstance(name, str) and re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) is not None
+def valid_header(name: str, value: str, reserved: set[str]) -> None:
+    if not isinstance(name, str) or re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) is None:
+        raise ValueError("Invalid header name")
+    if not isinstance(value, str) or not printable(value):
+        raise ValueError("Header values must contain only printable ASCII")
+    if name.lower() in reserved:
+        raise ValueError("Cannot override an SDK-owned or sensitive header")
 
 
 def validate_headers(headers: Mapping[str, str], *, part: bool = False) -> dict[str, str]:
     reserved = _RESERVED | (
-        {
+        _SENSITIVE_HEADERS
+        | {
             "content-disposition",
             "content-transfer-encoding",
-            "cookie",
-            "cookie2",
-            "proxy-authorization",
             "connection",
             "trailer",
         }
@@ -65,12 +70,7 @@ def validate_headers(headers: Mapping[str, str], *, part: bool = False) -> dict[
     )
     result = {}
     for name, value in headers.items():
-        if not header_name(name):
-            raise ValueError("Invalid header name")
-        if not isinstance(value, str) or not printable(value):
-            raise ValueError("Header values must contain only printable ASCII")
-        if name.lower() in reserved:
-            raise ValueError("Cannot override an SDK-owned or sensitive header")
+        valid_header(name, value, reserved)
         result[name.lower()] = value
     return result
 

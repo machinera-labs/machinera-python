@@ -10,8 +10,8 @@ from xml.etree import ElementTree
 
 import httpx
 
-from ._exceptions import APIResponseValidationError
-from ._files import header_name, printable
+from ._exceptions import invalid_response
+from ._files import _SENSITIVE_HEADERS, _SUFFIX_MIME_TYPES, valid_header
 from ._multipart import Multipart
 
 UploadPhase = Literal["upload_init", "upload_put", "submit", "poll"]
@@ -23,17 +23,7 @@ def initialization_key(operation_key: str) -> str:
 
 def descriptor(body: Multipart) -> dict[str, object]:
     suffix = PurePath(body.filename or "").suffix.lower()
-    content_type = body.content_type or {
-        ".wav": "audio/wav",
-        ".flac": "audio/flac",
-        ".ogg": "audio/ogg",
-        ".mp3": "audio/mpeg",
-        ".mpga": "audio/mpeg",
-        ".mpeg": "audio/mpeg",
-        ".m4a": "audio/mp4",
-        ".mp4": "video/mp4",
-        ".webm": "audio/webm",
-    }.get(suffix, "application/octet-stream")
+    content_type = body.content_type or _SUFFIX_MIME_TYPES.get(suffix, "application/octet-stream")
     return {
         "size_bytes": body.size,
         "content_type": content_type,
@@ -53,9 +43,7 @@ class Grant:
 
     @classmethod
     def parse(cls, data: dict[str, Any], expected: dict[str, object], status_code: int) -> Grant:
-        invalid = APIResponseValidationError(
-            "Invalid upload grant", status_code=status_code, retryable=False
-        )
+        invalid = invalid_response("Invalid upload grant", status_code=status_code)
         state = data.get("state")
         if state not in ("pending", "admitting", "bound", "expired", "reclaimed"):
             raise invalid
@@ -106,22 +94,11 @@ class Grant:
             if data.get("method") != "PUT" or not isinstance(supplied, dict):
                 raise invalid
             for name, value in supplied.items():
-                if (
-                    not header_name(name)
-                    or not isinstance(value, str)
-                    or not printable(value)
-                    or name.lower()
-                    in {
-                        "authorization",
-                        "cookie",
-                        "cookie2",
-                        "proxy-authorization",
-                        "user-agent",
-                        "host",
-                        "transfer-encoding",
-                    }
-                    or name.lower() in headers
-                ):
+                try:
+                    valid_header(name, value, _SENSITIVE_HEADERS | {"user-agent"})
+                except ValueError:
+                    raise invalid from None
+                if name.lower() in headers:
                     raise invalid
                 headers[name.lower()] = value
             if any(

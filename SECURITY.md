@@ -10,7 +10,7 @@
 
 This policy takes effect with the first published release. It does not promise
 long-term support or a fixed grace period. Supported Python versions are listed
-in the [README](README.md#versioning-and-requirements).
+in the [README](README.md#install-and-pin).
 
 ## Reporting a vulnerability
 

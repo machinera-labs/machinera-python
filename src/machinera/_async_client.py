@@ -5,14 +5,15 @@ import random
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
-from functools import partial, wraps
+from functools import partial
 from typing import Any, BinaryIO, Literal, cast
 
 import httpx
 
 from ._core import (
-    _P,
     _T,
+    EXCHANGE_POOL,
+    POLL_POOL,
     CloseFile,
     Core,
     Flow,
@@ -21,17 +22,16 @@ from ._core import (
     Send,
     Sleep,
     _Call,
-    local_failure,
+    _Interrupt,
+    _sanitized,
 )
 from ._exceptions import (
-    APIConnectionError,
-    APIError,
     DeadlineExceededError,
-    TranscriptionInterrupted,
 )
 from ._files import FileContent, FileInput, open_file
 from ._io import _storage_exchange, buffered
 from ._multipart import Multipart, UploadBody
+from ._pool import PoolKey, SharedAsyncTransport
 from ._types import (
     UNSET,
     JobSnapshot,
@@ -42,25 +42,6 @@ from ._types import (
     TranscriptionResult,
     Unset,
 )
-
-
-def _sanitized(function: Callable[_P, Awaitable[_T]]) -> Callable[_P, Awaitable[_T]]:
-    @wraps(function)
-    async def invoke(*args: _P.args, **kwargs: _P.kwargs) -> _T:
-        failure: APIError | ValueError | TypeError
-        try:
-            return await function(*args, **kwargs)
-        except (APIError, ValueError, TypeError) as error:
-            failure = error
-        failure.__context__ = None
-        failure.__cause__ = None
-        raise failure from None
-
-    return invoke
-
-
-class _Interrupt(Exception):
-    """Carry keyboard interruption through child tasks without stopping the event loop."""
 
 
 async def _thread(action: Callable[[], _T], abort: Callable[[], None] = lambda: None) -> _T:
@@ -153,6 +134,13 @@ class AsyncMachinera(Core):
         object.__setattr__(self, "_sleeper", sleeper)
         object.__setattr__(self, "_lifecycle", _Lifecycle(max_concurrency))
 
+    def _shared_transport(self, role: str) -> SharedAsyncTransport:
+        limits = POLL_POOL if role == "poll" else EXCHANGE_POOL
+        return SharedAsyncTransport(
+            PoolKey.of(role, limits),
+            lambda: httpx.AsyncHTTPTransport(limits=limits, trust_env=False),
+        )
+
     async def __aenter__(self) -> AsyncMachinera:
         return self
 
@@ -177,18 +165,12 @@ class AsyncMachinera(Core):
         key: str | None = None,
         *,
         phase: str = "prepare",
-        upload_id: str | None = None,
-        job_id: str | None = None,
+        **context: Any,
     ) -> AsyncIterator[_Call]:
-        call = self._new_call(
-            timeout, deadline, key, phase=phase, upload_id=upload_id, job_id=job_id
-        )
+        call = self._new_call(timeout, deadline, key, phase=phase, **context)
         life = self._lifecycle
         if life.closed:
-            error = APIConnectionError("Client is closed")
-            error._local = True
-            self._attach(error, call)
-            raise error
+            raise self._closed_error(call)
         life.active += 1
         life.idle.clear()
         acquired = False
@@ -205,19 +187,10 @@ class AsyncMachinera(Core):
             call.remaining()
             call.phase = phase
             yield call
-        except (APIError, asyncio.CancelledError) as error:
-            failure = error
-        except (ValueError, TypeError) as error:
-            if call.phase not in ("upload_init", "upload_put", "submit", "poll"):
+        except BaseException as error:
+            failure = self._classify(error, call, key)
+            if failure is None:
                 raise
-            failure = error
-        except (KeyboardInterrupt, _Interrupt):
-            failure = TranscriptionInterrupted(
-                "Transcription interrupted; use recovery context",
-                ambiguous=key is None and call.phase == "sync_submit",
-            )
-        except (OSError, httpx.HTTPError) as local:
-            failure = local_failure(local)
         finally:
             if acquired and life.semaphore is not None:
                 life.semaphore.release()
@@ -278,7 +251,7 @@ class AsyncMachinera(Core):
     @_sanitized
     async def get_job(self, job_id: str, *, timeout: Timeout = UNSET) -> JobSnapshot:
         """Read one job snapshot, retrying only eligible transient read failures."""
-        async with self._operation(timeout, None) as call:
+        async with self._operation(timeout, None, caller_key=None) as call:
             call.job_id = self._job_id(job_id)
             data, _ = await self._run(self._read_job(call))
             return data
@@ -303,7 +276,9 @@ class AsyncMachinera(Core):
         selected, context = self._resume_plan(
             job_id, file, operation_key, upload_id, model, language, response_format
         )
-        async with self._operation(timeout, deadline, operation_key, **context) as call:
+        async with self._operation(
+            timeout, deadline, operation_key, caller_key=True if job_id is None else None, **context
+        ) as call:
             return await self._run(
                 self._resume(call, file, model, filename, content_type, language, selected)
             )

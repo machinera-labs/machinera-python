@@ -9,7 +9,7 @@ from typing import Any, get_args
 import httpx
 import pytest
 from pydantic import BaseModel, ValidationError
-from test_client import MODEL, client, completed, result
+from support import MODEL, accepted, client, completed, error_code, recorder, result
 
 import machinera as m
 from machinera import _contract as contract
@@ -90,37 +90,68 @@ def test_every_contract_error_maps_to_its_exception(entry: contract.ErrorCode) -
 def test_status_heuristic_without_service_guidance(
     status: int, retryable: bool, body: dict[str, Any]
 ) -> None:
-    with client(lambda _: completed()) as sdk:
-        error = sdk._error(httpx.Response(status, **body))
+    calls: list[httpx.Request] = []
+    with client(recorder(lambda _: httpx.Response(status, **body), calls)) as sdk:
+        with pytest.raises(m.APIStatusError) as caught:
+            sdk.get_job("job-1")
+    error = caught.value
+    assert len(calls) == (m.RetryPolicy().max_attempts if retryable else 1)
     assert error.code is None and error.retryable is retryable
 
 
 @pytest.mark.parametrize(
-    "body,attempts",
+    "body,attempts,status,operation,kind",
     [
-        ({"error": {"code": "queue_operation_rejected", "retryable": True}}, 2),
-        ({"error": {"code": "input_busy", "retryable": False}}, 1),
-        ({"error": {"code": "input_busy"}}, 2),
-        ({"error": {"code": "queue_operation_rejected"}}, 1),
-        ({"error": {"code": "future_code"}}, 2),
-        ({"error": {"code": "future_code", "retryable": False}}, 1),
-        ({}, 2),
-        ({"error": {}}, 2),
-        ({"error": {"message": "Temporarily unavailable"}}, 2),
-        ({"message": "Temporarily unavailable"}, 2),
-        ({"error": {"code": [], "retryable": None}}, 2),
-        ({"error": {"retryable": "false"}}, 2),
-        ({"error": {"retryable": False}}, 1),
-        (None, 2),
+        (body, attempts, status, operation, m.APIError)
+        for body, attempts in [
+            ({"error": {"code": error_code(503, False), "retryable": True}}, 2),
+            ({"error": {"code": "input_busy", "retryable": False}}, 1),
+            ({"error": {"code": "input_busy"}}, 2),
+            ({"error": {"code": error_code(503, False)}}, 1),
+            ({"error": {"code": "future_code"}}, 2),
+            ({"error": {"code": "future_code", "retryable": False}}, 1),
+            ({}, 2),
+            ({"error": {}}, 2),
+            ({"error": {"message": "Temporarily unavailable"}}, 2),
+            ({"message": "Temporarily unavailable"}, 2),
+            ({"error": {"code": [], "retryable": None}}, 2),
+            ({"error": {"retryable": "false"}}, 2),
+            ({"error": {"retryable": False}}, 1),
+            (None, 2),
+        ]
+        for status in (429, 503)
+        for operation in ("get_job", "transcribe_url")
+    ]
+    + [
+        ({"error": {"code": code, "retryable": guidance}}, 1, 400, "keyed_file", m.BadRequestError)
+        for code, guidance in (
+            ("invalid_request", None),
+            ("invalid_request", False),
+            ("content_md5_mismatch", False),
+        )
+    ]
+    + [
+        (
+            {"error": {"code": "temporary_refusal", "retryable": True}},
+            2,
+            400,
+            "get_job",
+            m.APIError,
+        ),
+        (
+            {"error": {"code": "inline_completion_timeout", "retryable": True}},
+            1,
+            504,
+            "file",
+            m.InternalServerError,
+        ),
     ],
 )
-@pytest.mark.parametrize("status", [429, 503])
-@pytest.mark.parametrize("operation", ["get_job", "transcribe_url"])
 def test_retry_guidance_precedence(
-    body: dict[str, Any] | None, attempts: int, status: int, operation: str
+    body: dict[str, Any] | None, attempts: int, status: int, operation: str, kind: type[m.APIError]
 ) -> None:
     calls: list[httpx.Request] = []
-    method = "POST" if operation == "transcribe_url" else "GET"
+    method = "GET" if operation == "get_job" else "POST"
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method != method:
@@ -129,7 +160,7 @@ def test_retry_guidance_precedence(
         if len(calls) == 1:
             return httpx.Response(status, json=body) if body is not None else httpx.Response(status)
         if method == "POST":
-            return httpx.Response(202, json={"id": "job-1", "status": "queued"})
+            return accepted()
         return completed()
 
     with client(handler) as sdk:
@@ -139,10 +170,17 @@ def test_retry_guidance_precedence(
                 return sdk.transcribe_url(
                     "https://audio.example/clip.wav", model=MODEL, idempotency_key="saved-key"
                 )
-            return sdk.get_job("job-1")
+            if operation == "get_job":
+                return sdk.get_job("job-1")
+            return sdk.transcribe_file(
+                b"audio",
+                model=MODEL,
+                content_type="audio/wav",
+                **({"idempotency_key": "saved-key"} if operation == "keyed_file" else {}),
+            )
 
         if attempts == 1:
-            with pytest.raises(m.APIError):
+            with pytest.raises(kind):
                 invoke()
         else:
             output = invoke()
@@ -151,7 +189,7 @@ def test_retry_guidance_precedence(
             else:
                 assert output.text == result()["text"]
     assert len(calls) == attempts
-    if method == "POST":
+    if method == "POST" and operation != "file":
         assert all(request.headers["idempotency-key"] == "saved-key" for request in calls)
     if attempts == 2:
         assert calls[0].url == calls[1].url
@@ -229,55 +267,6 @@ def test_snapshot_metadata_and_typed_error() -> None:
     minimal = m.JobSnapshot(id="job-1", status="queued")
     assert minimal.result is minimal.error is minimal.created_at is minimal.updated_at is None
     assert minimal.eta_seconds is minimal.warnings is None
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("text", 12),
-        ("text", None),
-        ("words", [{"word": 12, "start": 0, "end": 1}]),
-        ("warnings", [12]),
-        ("warnings", [{"message": 12}]),
-    ],
-)
-@pytest.mark.parametrize("method", ["transcribe_file", "get_job", "resume"])
-def test_malformed_result_is_sanitized(field: str, value: Any, method: str) -> None:
-    body = {**result(), field: value, "secret": "sensitive-response-marker"}
-    payload = (
-        body
-        if method == "transcribe_file"
-        else {"id": "job-1", "status": "completed", "result": body}
-    )
-    with client(lambda _: httpx.Response(200, json=payload)) as sdk:
-        with pytest.raises(m.APIError) as caught:
-            if method == "transcribe_file":
-                sdk.transcribe_file(b"audio", model=MODEL, filename="clip.wav")
-            else:
-                getattr(sdk, method)("job-1")
-    error = caught.value
-    assert "sensitive-response-marker" not in str(error)
-    assert error.__context__ is error.__cause__ is None
-    assert error.body is None
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("id", 12),
-        ("status", []),
-        ("created_at", "secret"),
-        ("eta_seconds", "secret"),
-        ("error", {"retryable": "secret"}),
-    ],
-)
-def test_malformed_snapshot_is_sanitized(field: str, value: Any) -> None:
-    body = {"id": "job-1", "status": "queued", field: value}
-    with client(lambda _: httpx.Response(200, json=body)) as sdk:
-        with pytest.raises(m.APIError) as caught:
-            sdk.get_job("job-1")
-    assert "secret" not in str(caught.value)
-    assert caught.value.__context__ is caught.value.__cause__ is None
 
 
 @pytest.mark.parametrize("language", [contract.SERVED_LANGUAGE, contract.SERVED_LANGUAGE + "-US"])
@@ -392,23 +381,117 @@ def test_wire_raw_extension_cannot_populate_error_fields() -> None:
     assert error.raw == actual
 
 
-def test_poll_reuses_validated_result(monkeypatch: pytest.MonkeyPatch) -> None:
-    validated: list[m.TranscriptionResult] = []
-    original = m.Machinera._read_job
+MALFORMED_RESULTS = [
+    ("text", 12),
+    ("text", None),
+    ("words", [{"word": 12, "start": 0, "end": 1}]),
+    ("warnings", [12]),
+    ("warnings", [{"message": 12}]),
+]
+MALFORMED_SNAPSHOTS = [
+    ("id", 12),
+    ("status", []),
+    ("created_at", "secret"),
+    ("eta_seconds", "secret"),
+    ("error", {"retryable": "secret"}),
+]
+MALFORMED_RESPONSES = {
+    "missing_text": httpx.Response(200, json={"id": "job-1", "status": "completed", "result": {}}),
+    "invalid_json": httpx.Response(200, text="<html>invalid</html>"),
+    "bad_status": httpx.Response(200, json={"id": "job-1", "status": 7}),
+    "wrong_id": httpx.Response(200, json={"id": "job-2", "status": "queued"}),
+    "no_result": httpx.Response(200, json={"id": "job-1", "status": "completed"}),
+    "admission": httpx.Response(202, json={"status": "queued"}),
+    "sync": httpx.Response(200, json={"text": 7}),
+}
 
-    def read_job(self: m.Machinera, call: Any) -> Any:
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "method,response",
+    [
+        pytest.param(
+            method,
+            httpx.Response(
+                200,
+                json=(
+                    body
+                    if method == "transcribe_file"
+                    else {"id": "job-1", "status": "completed", "result": body}
+                ),
+            ),
+            id=f"result-{field}-{i}-{method}",
+        )
+        for i, (field, value) in enumerate(MALFORMED_RESULTS)
+        for body in [{**result(), field: value, "secret": "sensitive-response-marker"}]
+        for method in ("transcribe_file", "get_job", "resume")
+    ]
+    + [
+        pytest.param(
+            "get_job",
+            httpx.Response(200, json={"id": "job-1", "status": "queued", field: value}),
+            id=f"snapshot-{field}",
+        )
+        for field, value in MALFORMED_SNAPSHOTS
+    ]
+    + [
+        pytest.param(
+            "transcribe_url"
+            if kind == "admission"
+            else "transcribe_file"
+            if kind == "sync"
+            else "resume",
+            response,
+            id=kind,
+        )
+        for kind, response in MALFORMED_RESPONSES.items()
+    ],
+)
+def test_malformed_responses_are_sanitized(
+    method: str, response: httpx.Response, asynchronous: bool
+) -> None:
+    calls: list[httpx.Request] = []
+    response = httpx.Response(
+        response.status_code, content=response.content, headers=response.headers
+    )
+    with client(recorder(lambda _: response, calls), asynchronous=asynchronous) as sdk:
+        with pytest.raises(m.APIResponseValidationError) as caught:
+            if method == "transcribe_file":
+                sdk.transcribe_file(b"audio", model=MODEL, filename="clip.wav")
+            elif method == "transcribe_url":
+                sdk.transcribe_url("https://audio.example/a", model=MODEL)
+            else:
+                getattr(sdk, method)("job-1")
+    error = caught.value
+    assert not isinstance(error, m.APIConnectionError)
+    assert error.retryable is False and len(calls) == 1
+    assert error.status_code == response.status_code and error.body is None
+    assert "secret" not in str(error) and "sensitive-response-marker" not in str(error)
+    assert error.__context__ is error.__cause__ is None
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_poll_reuses_validated_result(monkeypatch: pytest.MonkeyPatch, asynchronous: bool) -> None:
+    validated: list[m.TranscriptionResult] = []
+    cls = m.AsyncMachinera if asynchronous else m.Machinera
+    original = cls._read_job
+
+    def read_job(self: m.Machinera | m.AsyncMachinera, call: Any) -> Any:
         snapshot, response = yield from original(self, call)
         assert snapshot.result is not None
         validated.append(snapshot.result)
         snapshot.result.raw["text"] = "changed after validation"
         return snapshot, response
 
-    monkeypatch.setattr(m.Machinera, "_read_job", read_job)
-    with client(lambda _: completed("actual")) as sdk:
+    monkeypatch.setattr(cls, "_read_job", read_job)
+    with client(lambda _: completed("actual"), asynchronous=asynchronous) as sdk:
         output = sdk.resume("job-1", response_format="text")
     assert output.text == output.output == "actual"
+    assert output is not validated[0]
+    assert output.raw["text"] == "changed after validation"
     assert output.raw is validated[0].raw
     assert output.words is validated[0].words
     assert output.job_id == "job-1" and output.request_id == "request-1"
     assert output.elapsed_seconds >= 0
     assert validated[0].job_id is None and validated[0].response_format == "json"
+    assert validated[0].request_id is None and validated[0].elapsed_seconds == 0

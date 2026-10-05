@@ -20,10 +20,10 @@ stdout to a private file if needed; do not send it to application logs. Avoid pu
 sensitive signed URLs in shell history. `handle_errors.py` prints only fixed recovery
 guidance to stderr and returns exit code 1 on API failures or local argument errors.
 It catches `APIError` for service and transport recovery metadata, and
-`ValueError`/`TypeError` for local configuration and input validation. The SDK
-performs bounded safe retries; applications must distinguish retrying from recovering an accepted job,
-resolving an ambiguous submission, and correcting a permanent failure. The README's
-recovery table is the complete decision order.
+`ValueError`/`TypeError` for local configuration and input validation.
+`recovery_guidance` maps failures to rows 1–7 of the
+[failure-handling table](../api.md#failure-handling) in order; follow that table for
+recovery and retry decisions.
 
 ## Asyncio
 
@@ -55,7 +55,7 @@ On failure, the example writes recovery context to stderr; keep it private.
 Resolve the failure before resuming with identical bytes and options. If a job ID
 is available, add `--job-id SAVED_JOB_ID` to the `--resume` command so recovery only
 polls; optionally pass `--upload-id SAVED_UPLOAD_ID` to preserve context. Before
-admission, `--resume` replays staged initialization, PUT and submission with the
+acceptance, `--resume` replays staged initialization, PUT and submission with the
 saved key. This recovery
 form is for staged inputs; inline job recovery uses the original keyed file call
 until a job ID is known. Do not reuse the sample key for independent operations.
@@ -81,11 +81,12 @@ for recovery. The file contains no source URL, audio, or transcript.
 
 If no job ID was recovered, repeat `submit` with the same state file and **identical
 URL and options** to reuse the saved operation key. The URL's content must also remain
-unchanged. Do not discard state to work around a replay-unavailable or terminal error;
-reconcile the original operation first. Once an ID is saved, use `resume`, which only
-reads that job and never submits another. Use `status` for one read, which prints
-the typed snapshot's `status` attribute. An expired result must be reconciled; save
-successful output before service retention ends. The command returns 0 on completion
+unchanged. On failure, keep the state file and follow the
+[failure-handling table](../api.md#failure-handling) to decide whether to use `resume`
+with a saved ID. Use `status` for one read, which prints the typed snapshot's
+`status` attribute. Save successful output before
+[service retention](https://api.machinera.com/docs/errors#retention) ends.
+The command returns 0 on completion
 or a saved deadline/interruption, 1 on failure, and 2 when status or resume has no saved ID,
 including when the state file does not exist.
 

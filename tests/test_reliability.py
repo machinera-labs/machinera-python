@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import builtins
 import hashlib
 import io
-import json
 import shutil
 import ssl
 import subprocess
@@ -20,7 +18,19 @@ from typing import Any
 
 import httpx
 import pytest
-from test_client import API, CREDENTIAL, MODEL, Clock, client, completed, open_client, result
+from support import (
+    API,
+    CREDENTIAL,
+    MODEL,
+    BlockedInputAccess,
+    Clock,
+    accepted,
+    client,
+    completed,
+    keepalive_server,
+    open_client,
+    result,
+)
 
 import machinera
 from machinera import (
@@ -28,16 +38,14 @@ from machinera import (
     APIConnectionError,
     BadRequestError,
     DeadlineExceededError,
-    InternalServerError,
     Machinera,
-    PermissionDeniedError,
     RetryPolicy,
     TimeoutPolicy,
 )
 from machinera._io import _ClaimedStream, _ClaimingBackend, _driver
 
 
-@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("keyed", [False, True])
 @pytest.mark.parametrize("guidance", [None, True])
 @pytest.mark.parametrize(
     "code,status",
@@ -49,7 +57,7 @@ from machinera._io import _ClaimedStream, _ClaimingBackend, _driver
     ],
 )
 def test_retryable_refusals_replay_exact_bytes(
-    asynchronous: bool, guidance: bool | None, code: str, status: int
+    keyed: bool, guidance: bool | None, code: str, status: int
 ) -> None:
     clock = Clock()
     submissions = []
@@ -63,15 +71,15 @@ def test_retryable_refusals_replay_exact_bytes(
             if guidance is not None:
                 detail["retryable"] = guidance
             return httpx.Response(status, json={"error": detail}, headers={"Retry-After": "2"})
-        if asynchronous:
-            return httpx.Response(202, json={"id": "job-1", "status": "queued"})
+        if keyed:
+            return accepted()
         return httpx.Response(200, json={"text": ""})
 
     with client(handler, clock) as sdk:
         sdk.transcribe_file(
             io.BytesIO(b"audio"),
             model=MODEL,
-            idempotency_key="saved" if asynchronous else None,
+            idempotency_key="saved" if keyed else None,
             content_type="audio/wav",
         )
     assert len(submissions) == 2 and clock.sleeps == [2]
@@ -80,58 +88,8 @@ def test_retryable_refusals_replay_exact_bytes(
     assert (
         hashlib.md5(submissions[0].content).hexdigest() == submissions[0].headers["x-content-md5"]
     )
-    if asynchronous:
+    if keyed:
         assert submissions[1].headers["idempotency-key"] == "saved"
-
-
-@pytest.mark.parametrize(
-    "code,guidance",
-    [("invalid_request", None), ("invalid_request", False), ("content_md5_mismatch", False)],
-)
-def test_validation_or_explicit_refusal_is_not_retried(code: str, guidance: bool | None) -> None:
-    requests = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(400, json={"error": {"code": code, "retryable": guidance}})
-
-    with client(handler) as sdk:
-        with pytest.raises(BadRequestError):
-            sdk.transcribe_file(
-                io.BytesIO(b"audio"), model=MODEL, idempotency_key="saved", content_type="audio/wav"
-            )
-    assert len(requests) == 1
-
-
-def test_explicit_service_guidance_overrides_status_heuristic_for_safe_replay() -> None:
-    requests = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if len(requests) == 1:
-            return httpx.Response(
-                400, json={"error": {"code": "temporary_refusal", "retryable": True}}
-            )
-        return completed()
-
-    with client(handler) as sdk:
-        sdk.resume("job-1")
-    assert len(requests) == 2
-
-
-def test_sync_execution_error_remains_unsafe_despite_retry_guidance() -> None:
-    requests = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            504, json={"error": {"code": "inline_completion_timeout", "retryable": True}}
-        )
-
-    with client(handler) as sdk:
-        with pytest.raises(InternalServerError):
-            sdk.transcribe_file(io.BytesIO(b"audio"), model=MODEL, content_type="audio/wav")
-    assert len(requests) == 1
 
 
 @pytest.mark.parametrize("deadline", [None, 1])
@@ -208,15 +166,6 @@ def test_multipart_fields_reject_framing_characters(field: str, bad: str) -> Non
         ):
             sdk.transcribe_file(io.BytesIO(b"audio"), **fields, content_type="audio/wav")
     assert requests == []
-
-
-def test_permission_error_does_not_shadow_builtin() -> None:
-    assert "PermissionError" not in machinera.__all__
-    assert "PermissionDeniedError" in machinera.__all__
-    assert PermissionDeniedError is not builtins.PermissionError
-    namespace: dict[str, Any] = {}
-    exec("from machinera import *", namespace)
-    assert "PermissionError" not in namespace
 
 
 @contextmanager
@@ -419,103 +368,55 @@ def test_cancelled_exchange_does_not_change_a_later_call() -> None:
 def test_deadline_during_input_access_releases_caller_before_input(
     monkeypatch: Any, owned: bool, blocked_phase: str
 ) -> None:
-    entered = threading.Event()
-    release_read = threading.Event()
-    exchange_finished = threading.Event()
-    connection_closed = threading.Event()
-    client_closed = threading.Event()
-    file_operations: list[str] = []
-    requests: list[httpx.Request] = []
-    expected_reads = {"hash": 1, "restore": 2, "upload": 3}[blocked_phase]
-
-    class SlowUpload(io.BytesIO):
-        reads = 0
-        seeks = 0
-
-        def seek(self, offset: int, whence: int = 0) -> int:
-            self.seeks += 1
-            file_operations.append("seek")
-            if blocked_phase == "restore" and self.seeks == 3:
-                entered.set()
-                assert release_read.wait(3)
-            return super().seek(offset, whence)
-
-        def read(self, size: int = -1) -> bytes:
-            self.reads += 1
-            file_operations.append("read")
-            if blocked_phase != "restore" and self.reads == expected_reads:
-                entered.set()
-                assert release_read.wait(3)
-            return super().read(size)
-
-    class Connection:
-        def get_extra_info(self, name: str) -> None:
-            return None
-
-        def close(self) -> None:
-            connection_closed.set()
-
-    class ReadingTransport(httpx.BaseTransport):
-        def handle_request(self, request: httpx.Request) -> httpx.Response:
-            requests.append(request)
-            request.extensions["trace"](
-                "connection.connect_tcp.complete", {"return_value": Connection()}
-            )
-            try:
-                request.read()
-                return httpx.Response(200, json={"text": ""})
-            finally:
-                exchange_finished.set()
-
-        def close(self) -> None:
-            client_closed.set()
-
-    source = SlowUpload(b"audio")
+    probe = BlockedInputAccess(blocked_phase)
     if owned:
-        monkeypatch.setattr("machinera._files.open", lambda *args: source, raising=False)
-    sdk = Machinera(api_key=CREDENTIAL, base_url=API, transport=ReadingTransport())
+        monkeypatch.setattr("machinera._files.open", lambda *args: probe.source, raising=False)
+    # A frozen operation clock gives every bounded phase the full deadline, so the
+    # phases before the blocked one cannot spend it on a slow runner and expire the
+    # call before the blocking access is reached; only the blocked phase's own
+    # real-time watchdog can fire.
+    sdk = Machinera(api_key=CREDENTIAL, base_url=API, transport=probe.transport, clock=Clock())
     try:
         with sdk:
-            start = time.monotonic()
             with pytest.raises(DeadlineExceededError) as caught:
                 sdk.transcribe_file(
-                    "recording.wav" if owned else source,
+                    "recording.wav" if owned else probe.source,
                     model=MODEL,
                     idempotency_key="saved",
-                    deadline=0.15,
+                    deadline=0.3,
                     content_type="audio/wav",
                 )
-            assert time.monotonic() - start < 0.6
-            assert entered.is_set() and not release_read.is_set()
-            assert source.reads == expected_reads and not source.closed
+            assert probe.entered.is_set() and not probe.release_read.is_set()
+            assert time.monotonic() - probe.entered_at[0] < 0.75
+            assert probe.source.reads == probe.expected_reads and not probe.source.closed
             assert not caught.value.wait_for_file_release(0)
             if blocked_phase == "upload":
-                assert connection_closed.wait(0.5)
+                assert probe.connection_closed.wait(0.5)
             else:
-                assert requests == [] and not connection_closed.is_set()
+                assert probe.requests == [] and not probe.connection_closed.is_set()
                 assert caught.value.phase == "prepare"
             if not owned:
                 with pytest.raises(ValueError, match="simultaneous"):
-                    sdk.transcribe_file(source, model=MODEL, content_type="audio/wav")
-            operations_at_abort = file_operations.copy()
-        assert time.monotonic() - start < 0.7
-        assert not client_closed.is_set() and not source.closed
-        release_read.set()
+                    sdk.transcribe_file(probe.source, model=MODEL, content_type="audio/wav")
+            operations_at_abort = probe.file_operations.copy()
+        assert time.monotonic() - probe.entered_at[0] < 0.85
+        assert not probe.client_closed.is_set() and not probe.source.closed
+        probe.release_read.set()
         assert caught.value.wait_for_file_release(1)
-        assert client_closed.wait(1)
+        assert probe.client_closed.wait(1)
         if blocked_phase == "upload":
-            assert exchange_finished.wait(1)
+            assert probe.exchange_finished.wait(1)
         else:
-            assert requests == [] and not exchange_finished.is_set()
-        assert file_operations == operations_at_abort
-        assert source.reads == expected_reads
-        assert source.closed is owned
+            assert probe.requests == [] and not probe.exchange_finished.is_set()
+        assert probe.file_operations == operations_at_abort
+        assert probe.source.reads == probe.expected_reads
+        assert probe.source.closed is owned
         if not owned:
-            source.seek(0)
-            assert source.read() == b"audio"
-            source.close()
+            probe.source.seek(0)
+            assert probe.source.read() == b"audio"
+            probe.source.close()
     finally:
-        release_read.set()
+        probe.release_read.set()
         sdk.close()
 
 
@@ -561,7 +462,7 @@ def test_deadline_during_file_acquisition_releases_exchange_and_client(
 
 @pytest.mark.parametrize("phase", ["prepare", "request"])
 @pytest.mark.parametrize("failure", ["construct", "start", "after_start"])
-def test_worker_startup_failure_releases_exchange_and_client(
+def test_thread_startup_failure_releases_exchange_and_client(
     monkeypatch: pytest.MonkeyPatch, phase: str, failure: str
 ) -> None:
     source = io.BytesIO(b"audio")
@@ -600,86 +501,6 @@ def test_worker_startup_failure_releases_exchange_and_client(
         if phase == "prepare":
             assert source.closed
     assert sdk._http.is_closed
-
-
-@contextmanager
-def keepalive_server(
-    stalled_get: int = 0, before_headers: bool = False, tls: ssl.SSLContext | None = None
-) -> Iterator[tuple[str, dict[str, Any]]]:
-    lock = threading.Lock()
-    stop = threading.Event()
-    state: dict[str, Any] = {"connections": 0, "gets": 0, "disconnected": threading.Event()}
-
-    class Handler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def log_message(self, format: str, *args: Any) -> None:
-            pass
-
-        def setup(self) -> None:
-            super().setup()
-            with lock:
-                state["connections"] += 1
-
-        def do_POST(self) -> None:
-            self.rfile.read(int(self.headers["Content-Length"]))
-            self.close_connection = True
-            self.connection.settimeout(3)
-            if self.connection.recv(1) == b"":
-                state["disconnected"].set()
-
-        def do_GET(self) -> None:
-            with lock:
-                state["gets"] += 1
-                count = state["gets"]
-            if count == stalled_get and before_headers:
-                self.close_connection = True
-                self.connection.settimeout(3)
-                try:
-                    closed = self.connection.recv(1) == b""
-                except (ssl.SSLEOFError, ConnectionResetError):
-                    closed = True
-                if closed:
-                    state["disconnected"].set()
-                return
-            if count == stalled_get:
-                self.send_response(200)
-                self.send_header("Content-Length", "100000")
-                self.end_headers()
-                try:
-                    while not stop.wait(0.02):
-                        self.wfile.write(b"a")
-                        self.wfile.flush()
-                except OSError:
-                    state["disconnected"].set()
-                self.close_connection = True
-                return
-            status = "completed" if self.path.endswith("job-done") else "processing"
-            job = self.path.rsplit("/", 1)[-1]
-            snapshot: dict[str, Any] = {"id": job, "status": status}
-            if status == "completed":
-                snapshot["result"] = result()
-            body = json.dumps(snapshot).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    server.daemon_threads = True
-    if tls is not None:
-        server.socket = tls.wrap_socket(server.socket, server_side=True)
-    thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
-    thread.start()
-    try:
-        scheme = "http" if tls is None else "https"
-        yield f"{scheme}://127.0.0.1:{server.server_port}/v1", state
-    finally:
-        stop.set()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -851,7 +672,20 @@ def test_poll_pool_falls_back_without_backend_hook(
         with Machinera(api_key=CREDENTIAL, base_url=endpoint) as sdk:
             sdk.get_job("job-1")
             sdk.get_job("job-1")
-            pool = sdk._poll_http._transport._pool  # type: ignore[attr-defined]
+            pool = sdk._poll_http._transport.current()._pool  # type: ignore[attr-defined]
             assert not isinstance(pool._network_backend, _ClaimingBackend)
             assert pool._max_keepalive_connections == 0
         assert state["connections"] == 2
+
+
+def test_failed_trace_does_not_interrupt_transport_cleanup() -> None:
+    from machinera._io import Exchange
+
+    def expired() -> None:
+        raise machinera.DeadlineExceededError("expired")
+
+    with httpx.Client() as http:
+        exchange = Exchange(http, httpx.Request("GET", API), expired, lambda: None)
+        exchange.trace("http11.receive_response_body.failed", {"exception": GeneratorExit()})
+        with pytest.raises(machinera.DeadlineExceededError):
+            exchange.trace("http11.receive_response_body.started", {})

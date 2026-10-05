@@ -12,6 +12,7 @@ import httpx
 from ._core import (
     _T,
     EXCHANGE_POOL,
+    POLL_POOL,
     CloseFile,
     Core,
     Flow,
@@ -20,17 +21,14 @@ from ._core import (
     Sleep,
     _Call,
     _sanitized,
-    local_failure,
 )
 from ._exceptions import (
-    APIConnectionError,
-    APIError,
     DeadlineExceededError,
-    TranscriptionInterrupted,
 )
 from ._files import FileContent, FileInput, open_file
 from ._io import Exchange, keepalive_transport, run_bounded
 from ._multipart import Multipart, UploadBody
+from ._pool import PoolKey, SharedTransport
 from ._types import (
     UNSET,
     JobSnapshot,
@@ -101,8 +99,15 @@ class Machinera(Core):
         object.__setattr__(self, "_sleeper", sleeper)
         object.__setattr__(self, "_lifecycle", _Lifecycle(max_concurrency))
 
-    def _poll_transport(self, limits: httpx.Limits) -> httpx.HTTPTransport:
-        return keepalive_transport(limits, EXCHANGE_POOL)
+    def _shared_transport(self, role: str) -> SharedTransport:
+        if role == "poll":
+            return SharedTransport(
+                PoolKey.of("poll", POLL_POOL), lambda: keepalive_transport(POLL_POOL, EXCHANGE_POOL)
+            )
+        return SharedTransport(
+            PoolKey.of("exchange", EXCHANGE_POOL),
+            lambda: httpx.HTTPTransport(limits=EXCHANGE_POOL, trust_env=False),
+        )
 
     def __enter__(self) -> Machinera:
         return self
@@ -144,22 +149,16 @@ class Machinera(Core):
         key: str | None = None,
         *,
         phase: str = "prepare",
-        upload_id: str | None = None,
-        job_id: str | None = None,
+        **context: Any,
     ) -> Iterator[_Call]:
-        call = self._new_call(
-            timeout, deadline, key, phase=phase, upload_id=upload_id, job_id=job_id
-        )
+        call = self._new_call(timeout, deadline, key, phase=phase, **context)
         life = self._lifecycle
         with life.condition:
             if life.closed:
-                error = APIConnectionError("Client is closed")
-                error._local = True
-                self._attach(error, call)
-                raise error
+                raise self._closed_error(call)
             life.active += 1
         acquired = False
-        failure: APIError | None = None
+        failure: BaseException | None = None
         try:
             if life.semaphore is not None:
                 call.phase = "concurrency_wait" if phase == "prepare" else phase
@@ -169,26 +168,10 @@ class Machinera(Core):
             call.remaining()
             call.phase = phase
             yield call
-        except APIError as error:
-            failure = error
-        except (ValueError, TypeError) as error:
-            if call.phase not in ("upload_init", "upload_put", "submit", "poll"):
+        except BaseException as error:
+            failure = self._classify(error, call, key, blocking=True)
+            if failure is None:
                 raise
-            for name, value in (
-                ("operation_key", call.operation_key),
-                ("upload_id", call.upload_id),
-                ("phase", call.phase),
-                ("job_id", call.job_id),
-            ):
-                setattr(error, name, value)
-            raise
-        except KeyboardInterrupt:
-            failure = TranscriptionInterrupted(
-                "Transcription interrupted; use recovery context",
-                ambiguous=key is None and call.phase == "sync_submit",
-            )
-        except (OSError, httpx.HTTPError) as local:
-            failure = local_failure(local)
         finally:
             if acquired and life.semaphore is not None:
                 life.semaphore.release()
@@ -277,7 +260,7 @@ class Machinera(Core):
     @_sanitized
     def get_job(self, job_id: str, *, timeout: Timeout = UNSET) -> JobSnapshot:
         """Read one job snapshot, retrying only eligible transient read failures."""
-        with self._operation(timeout, None) as call:
+        with self._operation(timeout, None, caller_key=None) as call:
             call.job_id = self._job_id(job_id)
             data, _ = self._run(self._read_job(call))
             return data
@@ -302,7 +285,9 @@ class Machinera(Core):
         selected, context = self._resume_plan(
             job_id, file, operation_key, upload_id, model, language, response_format
         )
-        with self._operation(timeout, deadline, operation_key, **context) as call:
+        with self._operation(
+            timeout, deadline, operation_key, caller_key=True if job_id is None else None, **context
+        ) as call:
             return self._run(
                 self._resume(call, file, model, filename, content_type, language, selected)
             )

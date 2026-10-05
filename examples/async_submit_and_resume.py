@@ -114,7 +114,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 result = await client.resume(state["job_id"])
     except (APIError, OSError, ValueError, TypeError):
         print(
-            "Operation failed; retain the state file and reconcile before retrying.",
+            "Operation failed; retain the state file and follow "
+            "https://github.com/machinera-labs/machinera-python/blob/main/api.md#failure-handling",
             file=sys.stderr,
         )
         return 1

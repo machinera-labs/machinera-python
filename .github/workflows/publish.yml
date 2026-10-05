@@ -12,7 +12,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  ci:
+    if: github.repository == 'machinera-labs/machinera-python'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
   build:
+    needs: ci
     if: github.repository == 'machinera-labs/machinera-python'
     runs-on: ubuntu-latest
     permissions:
@@ -35,24 +41,6 @@ jobs:
             identical|behind) ;;
             *) echo "::error::Tagged commit $GITHUB_SHA is not on main (compare status: $status)"; exit 1 ;;
           esac
-      - name: Wait for a successful CI run for the tagged commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          deadline=$(( $(date +%s) + 1800 ))
-          while :; do
-            runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow CI --commit "$GITHUB_SHA" --json status,conclusion --jq '.[] | "\(.status) \(.conclusion)"') || runs=""
-            if grep -q ' success$' <<<"$runs"; then
-              exit 0
-            fi
-            if grep -E '^completed ' <<<"$runs" | grep -qv ' success$'; then
-              echo "::error::CI for $GITHUB_SHA completed without success"; exit 1
-            fi
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::Timed out after 30 minutes waiting for CI on $GITHUB_SHA"; exit 1
-            fi
-            sleep 30
-          done
       - run: python -m build
       - run: twine check dist/*
       - name: Check tag and distribution versions

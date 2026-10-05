@@ -12,7 +12,30 @@ from typing import Any
 
 import httpx
 import pytest
-from test_client import API, CREDENTIAL, MODEL, Clock, client, completed, result
+from support import (
+    API,
+    AUDIO,
+    CREDENTIAL,
+    MODEL,
+    SIGNED,
+    WALL,
+    Clock,
+    InterruptedFile,
+    ProbeFile,
+    ReplayService,
+    Service,
+    accepted,
+    client,
+    completed,
+    context,
+    grant,
+    mounted_storage_client,
+    recorder,
+    request_phase,
+    result,
+    staged_unavailable,
+    transcribe,
+)
 
 from machinera import (
     APIConnectionError,
@@ -28,88 +51,7 @@ from machinera import (
     TranscriptionInterrupted,
     UploadError,
 )
-
-AUDIO = b"audio-bytes" * 15000
-WALL = 1_700_000_000
-SIGNED = "https://storage.example/object?signature=private-signature"
-
-
-def grant(data: dict[str, Any], **changes: Any) -> dict[str, Any]:
-    return {
-        "upload_id": "upload-1",
-        "state": "pending",
-        "put_url": SIGNED,
-        "method": "PUT",
-        "required_headers": {
-            "Content-Length": str(data["size_bytes"]),
-            "Content-Type": data["content_type"],
-            "Content-MD5": data["content_md5"],
-            "If-None-Match": "*",
-        },
-        "expires_at": WALL + 300,
-        "upload_expires_at": WALL + 3600,
-        "limits": {
-            "max_upload_bytes": 2**31,
-            "sync_inline_body_bytes": 100,
-            "async_inline_body_bytes": 200,
-            "put_ttl_seconds": 300,
-            "upload_window_seconds": 3600,
-            "retention_max_seconds": 7200,
-            "policy_revision": "v1",
-        },
-        **changes,
-    }
-
-
-class Service:
-    def __init__(self) -> None:
-        self.calls: list[httpx.Request] = []
-        self.initializations: list[dict[str, Any]] = []
-        self.puts: list[bytes] = []
-        self.submissions: list[dict[str, Any]] = []
-        self.descriptor: dict[str, Any] = {}
-
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        self.calls.append(request)
-        if request.url.path == "/v1/uploads":
-            self.descriptor = json.loads(request.content)
-            self.initializations.append(self.descriptor)
-            return httpx.Response(201, json=grant(self.descriptor))
-        if request.method == "PUT":
-            data = request.read()
-            assert len(data) == int(request.headers["content-length"])
-            assert (
-                base64.b64encode(hashlib.md5(data).digest()).decode()
-                == request.headers["content-md5"]
-            )
-            assert request.headers["if-none-match"] == "*"
-            assert set(request.headers) == {
-                "host",
-                "content-length",
-                "content-type",
-                "content-md5",
-                "if-none-match",
-            }
-            self.puts.append(data)
-            return httpx.Response(200)
-        if request.method == "POST":
-            if request.headers["content-type"] == "application/json":
-                self.submissions.append(json.loads(request.content))
-            return httpx.Response(202, json={"id": "job-1"})
-        return completed()
-
-
-def transcribe(sdk: Machinera, **kwargs: Any) -> Any:
-    return sdk.transcribe_file(
-        kwargs.pop("file", AUDIO), model=MODEL, filename="recording.wav", **kwargs
-    )
-
-
-def context(error: APIError, phase: str, upload_id: str | None = "upload-1") -> None:
-    assert error.operation_key == "saved-key"
-    assert error.upload_id == upload_id
-    assert error.phase == phase
-    assert error.__cause__ is error.__context__ is None
+from machinera._files import _SUFFIX_MIME_TYPES
 
 
 @pytest.mark.parametrize("status", [200, 201])
@@ -171,8 +113,18 @@ def test_round_trip_checksums_headers_and_replay(status: int, forced: bool) -> N
     )
 
 
-@pytest.mark.parametrize("step", ["upload_init", "upload_put", "submit"])
-def test_lost_response_replays_same_operation(step: str) -> None:
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "step,failure",
+    [
+        ("upload_init", "lost"),
+        ("upload_put", "lost"),
+        ("submit", "lost"),
+        ("upload_put", "503"),
+        ("upload_put", "412"),
+    ],
+)
+def test_lost_response_replays_same_operation(step: str, failure: str, asynchronous: bool) -> None:
     service = Service()
     failed = False
 
@@ -188,23 +140,47 @@ def test_lost_response_replays_same_operation(step: str) -> None:
         response = service(request)
         if current == step and not failed:
             failed = True
-            raise httpx.ReadError(SIGNED)
-        if current == "upload_put" and step == "upload_put":
+            if failure == "lost":
+                raise httpx.ReadError(SIGNED)
+            return httpx.Response(int(failure), text="<Error><Code>AccessDenied</Code></Error>")
+        if current == "upload_put" and step == "upload_put" and failure == "lost":
             return httpx.Response(412)
         if current == "upload_init" and step == "upload_init":
             response.status_code = 200
         return response
 
-    with client(handler, limits=Limits(1, 2)) as sdk:
+    with client(handler, limits=Limits(1, 2), asynchronous=asynchronous) as sdk:
         assert transcribe(sdk, idempotency_key="saved-key").job_id == "job-1"
-    assert len(service.puts) == (2 if step == "upload_put" else 1)
+    assert len(service.puts) == (2 if step == "upload_put" and failure != "412" else 1)
     for path in ("/v1/uploads", "/v1/transcription_jobs"):
         requests = [r for r in service.calls if r.url.path == path]
         assert len({r.headers["idempotency-key"] for r in requests}) == 1
         assert len({r.content for r in requests}) == 1
 
 
-def test_expired_grant_refreshes_same_subkey() -> None:
+@pytest.mark.parametrize("keyed", [False, True])
+@pytest.mark.parametrize("step", ["upload_init", "submit"])
+def test_lost_staged_responses_are_transient_unless_a_job_may_exist(step: str, keyed: bool) -> None:
+    service = Service()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = service(request)
+        path = "/v1/uploads" if step == "upload_init" else "/v1/transcription_jobs"
+        if request.url.path == path:
+            raise httpx.ReadError("response lost after send")
+        return response
+
+    with client(handler, limits=Limits(1, 2)) as sdk:
+        with pytest.raises(APIConnectionError) as caught:
+            transcribe(sdk, idempotency_key="saved-key" if keyed else None)
+    error = caught.value
+    assert error.phase == step and error.job_id is None
+    # Only a lost submission may have created a job that an unkeyed repeat would duplicate.
+    assert error.is_transient is (keyed or step == "upload_init")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_expired_grant_refreshes_same_subkey(asynchronous: bool) -> None:
     service = Service()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -219,8 +195,8 @@ def test_expired_grant_refreshes_same_subkey() -> None:
             )
         return response
 
-    with client(handler, limits=Limits(1, 2)) as sdk:
-        transcribe(sdk)
+    with client(handler, limits=Limits(1, 2), asynchronous=asynchronous) as sdk:
+        assert transcribe(sdk).job_id == "job-1"
     requests = [r for r in service.calls if r.url.path.endswith("uploads")]
     assert len(requests) == 2
     assert requests[0].headers["idempotency-key"] == requests[1].headers["idempotency-key"]
@@ -228,8 +204,11 @@ def test_expired_grant_refreshes_same_subkey() -> None:
     assert len(service.puts) == 1
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("status", [301, 307, 401, 403])
-def test_storage_errors_are_sanitized_and_never_followed(status: int, caplog: Any) -> None:
+def test_storage_errors_are_sanitized_and_never_followed(
+    status: int, caplog: Any, asynchronous: bool
+) -> None:
     service = Service()
     caplog.set_level("DEBUG")
 
@@ -243,7 +222,7 @@ def test_storage_errors_are_sanitized_and_never_followed(status: int, caplog: An
             )
         return response
 
-    with client(handler, limits=Limits(1, 2)) as sdk:
+    with client(handler, limits=Limits(1, 2), asynchronous=asynchronous) as sdk:
         with pytest.raises(UploadError) as caught:
             transcribe(sdk, idempotency_key="saved-key")
     error = caught.value
@@ -264,7 +243,7 @@ def test_storage_errors_are_sanitized_and_never_followed(status: int, caplog: An
         "broken",
     ],
 )
-def test_storage_code_allowlist(code: str) -> None:
+def test_storage_code_is_kept_only_when_well_formed(code: str) -> None:
     service = Service()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -395,8 +374,9 @@ def test_terminal_service_errors(phase: str, status: int, code: str) -> None:
         assert "service inline limit" in str(caught.value)
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("mutation", ["size", "content"])
-def test_mutated_file_fails_before_put_completes(mutation: str) -> None:
+def test_mutated_file_fails_before_put_completes(mutation: str, asynchronous: bool) -> None:
     service = Service()
     source = io.BytesIO(AUDIO)
 
@@ -408,7 +388,7 @@ def test_mutated_file_fails_before_put_completes(mutation: str) -> None:
             source.seek(0)
         return response
 
-    with client(handler, limits=Limits(1, 2)) as sdk:
+    with client(handler, limits=Limits(1, 2), asynchronous=asynchronous) as sdk:
         with pytest.raises(IntegrityError) as caught:
             transcribe(sdk, file=source, idempotency_key="saved-key")
     context(caught.value, "upload_put")
@@ -416,18 +396,9 @@ def test_mutated_file_fails_before_put_completes(mutation: str) -> None:
     assert not source.closed and source.tell() == 0
 
 
-def test_nonseekable_rejected_before_http() -> None:
-    class Nonseekable(io.BytesIO):
-        def seekable(self) -> bool:
-            return False
-
-    with client(lambda _: pytest.fail("unexpected HTTP"), limits=Limits(1, 2)) as sdk:
-        with pytest.raises(ValueError, match="seekable"):
-            transcribe(sdk, file=Nonseekable(AUDIO))
-
-
+@pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("phase", ["upload_init", "upload_put", "submit", "poll"])
-def test_resume_each_phase(phase: Any) -> None:
+def test_resume_continues_from_each_failed_phase(phase: Any, asynchronous: bool) -> None:
     service = Service()
     failed = False
 
@@ -449,7 +420,7 @@ def test_resume_each_phase(phase: Any) -> None:
 
     source = io.BytesIO(b"skip" + AUDIO)
     source.seek(4)
-    with client(handler, limits=Limits(1, 2), max_retries=0) as sdk:
+    with client(handler, limits=Limits(1, 2), max_retries=0, asynchronous=asynchronous) as sdk:
         with pytest.raises(APIConnectionError) as caught:
             transcribe(sdk, file=source, idempotency_key="saved-key")
         error = caught.value
@@ -469,6 +440,8 @@ def test_resume_each_phase(phase: Any) -> None:
     else:
         assert service.calls[before].url.path == "/v1/uploads"
     assert service.puts[-1] == AUDIO
+
+    assert service.calls[-2].headers["idempotency-key"] == "saved-key" if phase != "poll" else True
 
 
 @pytest.mark.parametrize("interrupt", [False, True])
@@ -496,12 +469,14 @@ def test_stalled_put_cancelled_without_waiting_for_transport() -> None:
     service = Service()
     release = threading.Event()
     finished = threading.Event()
+    entered = threading.Event()
 
     class Transport(httpx.BaseTransport):
         def handle_request(self, request: httpx.Request) -> httpx.Response:
             if request.method == "PUT":
                 try:
-                    release.wait(5)
+                    entered.set()
+                    assert release.wait(3)
                     request.read()
                     return httpx.Response(200)
                 finally:
@@ -511,32 +486,19 @@ def test_stalled_put_cancelled_without_waiting_for_transport() -> None:
 
     try:
         with Machinera(
-            api_key=CREDENTIAL, transport=Transport(), limits=Limits(1, 2), wall_clock=lambda: WALL
+            api_key=CREDENTIAL,
+            transport=Transport(),
+            limits=Limits(1, 2),
+            wall_clock=lambda: WALL,
+            clock=Clock(),
         ) as sdk:
             with pytest.raises(DeadlineExceededError) as caught:
-                transcribe(sdk, deadline=0.1, idempotency_key="saved-key")
+                transcribe(sdk, deadline=0.3, idempotency_key="saved-key")
         context(caught.value, "upload_put")
-        assert not finished.is_set()
+        assert entered.is_set() and not finished.is_set()
     finally:
         release.set()
         assert finished.wait(2)
-
-
-def test_selection_at_exact_cap_and_one_byte_over() -> None:
-    sizes: list[int] = []
-
-    def measure(request: httpx.Request) -> httpx.Response:
-        sizes.append(len(request.content))
-        return httpx.Response(200, json={"text": ""})
-
-    with client(measure) as sdk:
-        transcribe(sdk, file=b"a")
-    for delta in (0, 1):
-        service = Service()
-        with client(service, limits=Limits(1, sizes[0])) as sdk:
-            transcribe(sdk, file=b"a" * (1 + delta))
-        assert bool(service.initializations) == bool(delta)
-        assert service.calls[0].url.path == ("/v1/uploads" if delta else "/v1/transcription_jobs")
 
 
 @pytest.mark.parametrize("keyed", [False, True])
@@ -563,13 +525,6 @@ def test_default_selection_around_staged_threshold(mib: int, keyed: bool) -> Non
     assert bool(service.puts) == (mib == 60)
 
 
-def unavailable(limits: dict[str, Any] | None) -> httpx.Response:
-    error: dict[str, Any] = {"code": "staged_uploads_unavailable", "retryable": False}
-    if limits is not None:
-        error["limits"] = limits
-    return httpx.Response(503, json={"error": error})
-
-
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("source", ["envelope", "contract"])
 @pytest.mark.parametrize("outcome", ["accepted", "refused"])
@@ -581,7 +536,7 @@ def test_staged_unavailable_falls_back_to_inline_job(
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/uploads":
             service.calls.append(request)
-            return unavailable(
+            return staged_unavailable(
                 {"async_inline_body_bytes": 2 * len(AUDIO)} if source == "envelope" else None
             )
         if request.method == "POST" and outcome == "refused":
@@ -621,7 +576,7 @@ def test_staged_unavailable_above_service_cap_raises(
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
-        return unavailable(
+        return staged_unavailable(
             {"async_inline_body_bytes": len(AUDIO)} if source == "envelope" else None
         )
 
@@ -642,7 +597,7 @@ def test_staged_unavailable_after_grant_does_not_fall_back(asynchronous: bool) -
         if request.url.path.endswith("uploads"):
             if service.initializations:
                 service.calls.append(request)
-                return unavailable({"async_inline_body_bytes": 2**30})
+                return staged_unavailable({"async_inline_body_bytes": 2**30})
             service(request)
             return httpx.Response(201, json=grant(service.descriptor, expires_at=WALL - 1))
         return service(request)
@@ -734,12 +689,16 @@ def test_content_type_resolution_and_options(
     assert output.output == result()["text"]
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("state", ["bound", "admitting"])
-def test_recovery_without_a_write_grant(state: str) -> None:
+def test_recovery_without_a_write_grant(state: str, asynchronous: bool) -> None:
     service = Service()
+    initializations = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initializations
         if request.url.path.endswith("uploads"):
+            initializations += 1
             data = json.loads(request.content)
             response = grant(data, state=state, expires_at=WALL - 100, upload_expires_at=WALL - 50)
             for field in ("put_url", "required_headers", "method"):
@@ -750,10 +709,12 @@ def test_recovery_without_a_write_grant(state: str) -> None:
             return httpx.Response(200, json=response)
         return service(request)
 
-    with client(handler, limits=Limits(1, 2)) as sdk:
+    with client(handler, limits=Limits(1, 2), asynchronous=asynchronous) as sdk:
         assert transcribe(sdk).job_id == "job-1"
     assert not service.puts
     assert len(service.submissions) == 1
+
+    assert initializations == 1
 
 
 @pytest.mark.parametrize("changed_window", [False, True])
@@ -860,40 +821,6 @@ def test_resume_rejects_different_upload_id() -> None:
     assert not service.puts
 
 
-def test_staged_hashing_and_put_use_bounded_reads_and_restore_offset() -> None:
-    reads: list[int] = []
-
-    class Source(io.BytesIO):
-        def read(self, size: int = -1) -> bytes:
-            assert 0 < size <= 65536
-            reads.append(size)
-            return super().read(size)
-
-    source = Source(b"skip" + AUDIO)
-    source.seek(4)
-    service = Service()
-    with client(service, limits=Limits(1, 2)) as sdk:
-        transcribe(sdk, file=source)
-    chunks = (len(AUDIO) + 65535) // 65536
-    assert len(reads) == 2 * chunks + 2
-    assert not source.closed and source.tell() == 4
-    assert service.puts == [AUDIO]
-
-
-def test_deadline_during_staged_hashing_retains_key() -> None:
-    clock = Clock()
-
-    class Slow(io.BytesIO):
-        def read(self, size: int = -1) -> bytes:
-            clock.now += 5
-            return super().read(size)
-
-    with client(lambda _: pytest.fail("unexpected HTTP"), clock, limits=Limits(1, 2)) as sdk:
-        with pytest.raises(DeadlineExceededError) as caught:
-            transcribe(sdk, file=Slow(AUDIO), deadline=1, idempotency_key="saved-key")
-    context(caught.value, "upload_init", None)
-
-
 def test_accepted_job_outlives_deadline_with_upload_context() -> None:
     service = Service()
     clock = Clock()
@@ -986,7 +913,7 @@ def test_stalled_input_read_during_put_preserves_file_ownership() -> None:
     try:
         with client(handler, limits=Limits(1, 2)) as sdk:
             with pytest.raises(DeadlineExceededError) as caught:
-                transcribe(sdk, file=source, deadline=0.1, idempotency_key="saved-key")
+                transcribe(sdk, file=source, deadline=0.3, idempotency_key="saved-key")
         context(caught.value, "upload_put")
         assert entered.is_set() and not source.closed
         assert not caught.value.wait_for_file_release(0)
@@ -994,28 +921,6 @@ def test_stalled_input_read_during_put_preserves_file_ownership() -> None:
         release.set()
     assert caught.value.wait_for_file_release(2)
     assert not source.closed and not service.submissions
-
-
-def test_resume_semaphore_deadline_preserves_known_identifiers() -> None:
-    entered = threading.Event()
-    release = threading.Event()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        entered.set()
-        release.wait(5)
-        return completed()
-
-    with client(handler, max_concurrency=1) as sdk, ThreadPoolExecutor(1) as pool:
-        running = pool.submit(sdk.resume, "job-1")
-        assert entered.wait(2)
-        try:
-            with pytest.raises(DeadlineExceededError) as caught:
-                sdk.resume("job-2", operation_key="saved-key", upload_id="upload-1", deadline=0.1)
-            context(caught.value, "poll")
-            assert caught.value.job_id == "job-2"
-        finally:
-            release.set()
-        running.result()
 
 
 def test_local_staged_input_failure_retains_context() -> None:
@@ -1032,54 +937,25 @@ def test_local_staged_input_failure_retains_context() -> None:
     assert caught.value.__context__ is caught.value.__cause__ is None
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("mount", ["all://", "https://storage.example"])
 @pytest.mark.parametrize("status", [200, 307])
 def test_storage_uses_injected_mount_without_client_credentials(
-    mount: str, status: int, caplog: pytest.LogCaptureFixture
+    mount: str, status: int, caplog: pytest.LogCaptureFixture, asynchronous: bool
 ) -> None:
     service = Service()
-    routed: list[httpx.Request] = []
-    request_hooks: list[httpx.Request] = []
-    response_hooks: list[httpx.Response] = []
     caplog.set_level("DEBUG")
-
-    def default_transport(request: httpx.Request) -> httpx.Response:
-        assert request.method != "PUT", "Storage bypassed the caller's mount"
-        return service(request)
-
-    def mounted_transport(request: httpx.Request) -> httpx.Response:
-        routed.append(request)
-        response = service(request)
-        if request.method == "PUT":
-            return httpx.Response(status, headers={"Location": SIGNED + "redirect"})
-        return response
-
-    with httpx.Client(
-        transport=httpx.MockTransport(default_transport),
-        mounts={mount: httpx.MockTransport(mounted_transport)},
-        auth=("private-user", "private-password"),
-        headers={
-            "Authorization": "Bearer private-client-key",
-            "Cookie": "private-default-cookie",
-            "User-Agent": "private-client-agent",
-            "X-Default": "private-header",
-        },
-        cookies={"session": "private-cookie"},
-        event_hooks={"request": [request_hooks.append], "response": [response_hooks.append]},
-        follow_redirects=True,
-        trust_env=False,
-    ) as http:
-        with Machinera(
-            api_key=CREDENTIAL, http_client=http, limits=Limits(1, 2), wall_clock=lambda: WALL
-        ) as sdk:
-            if status == 200:
-                assert transcribe(sdk).job_id == "job-1"
-            else:
-                with pytest.raises(UploadError) as caught:
-                    transcribe(sdk, idempotency_key="saved-key")
-                context(caught.value, "upload_put")
-                assert caught.value.status_code == status
-                assert not service.submissions
+    with mounted_storage_client(service, mount, status, asynchronous) as setup:
+        sdk, http, routed, request_hooks, response_hooks = setup
+        if status == 200:
+            assert transcribe(sdk).job_id == "job-1"
+        else:
+            with pytest.raises(UploadError) as caught:
+                transcribe(sdk, idempotency_key="saved-key")
+            context(caught.value, "upload_put")
+            assert caught.value.status_code == status
+            assert not service.submissions
+        sdk.aclose() if asynchronous else sdk.close()
         assert not http.is_closed
     puts = [request for request in routed if request.method == "PUT"]
     assert len(puts) == 1 and service.puts == [AUDIO]
@@ -1094,6 +970,9 @@ def test_storage_uses_injected_mount_without_client_credentials(
         "if-none-match": "*",
     }
     assert SIGNED not in caplog.text and "private-signature" not in caplog.text
+
+    if status == 200:
+        assert "/transcription_jobs" in caplog.text
 
 
 def test_storage_log_filter_preserves_concurrent_api_logging(
@@ -1150,33 +1029,10 @@ def test_mounted_responses_preserve_decoded_content_and_headers() -> None:
     assert output.request_id == "request-compressed"
 
 
-@pytest.mark.parametrize("binding_path", ["initialization", "refresh"])
+@pytest.mark.parametrize("grant_path", ["initialization", "refresh"])
 @pytest.mark.parametrize("changed_option", [None, "model", "language", "response_format"])
-def test_bound_replay_validates_job_options(binding_path: str, changed_option: str | None) -> None:
-    service = Service()
-    accepted: dict[str, Any] | None = None
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal accepted
-        response = service(request)
-        if request.url.path.endswith("uploads") and accepted is not None:
-            if binding_path == "refresh" and len(service.initializations) == 2:
-                return httpx.Response(200, json=grant(service.descriptor, expires_at=WALL - 1))
-            bound = grant(service.descriptor, state="bound", job_id="job-1")
-            for field in ("put_url", "required_headers", "method"):
-                bound.pop(field)
-            return httpx.Response(200, json=bound)
-        if request.url.path.endswith("jobs"):
-            assert request.headers["idempotency-key"] == "saved-key"
-            submitted = service.submissions[-1]
-            if accepted is None:
-                accepted = submitted
-            elif submitted != accepted:
-                return httpx.Response(
-                    422,
-                    json={"error": {"code": "idempotency_payload_mismatch", "retryable": False}},
-                )
-        return response
+def test_upload_replay_validates_job_options(grant_path: str, changed_option: str | None) -> None:
+    service = ReplayService(grant_path)
 
     options = {"model": MODEL, "language": "en", "response_format": "json"}
     replay_options = dict(options)
@@ -1186,7 +1042,7 @@ def test_bound_replay_validates_job_options(binding_path: str, changed_option: s
             "language": "en-US",
             "response_format": "text",
         }[changed_option]
-    with client(handler, limits=Limits(1, 2)) as sdk:
+    with client(service, limits=Limits(1, 2)) as sdk:
         original = sdk.transcribe_file(
             AUDIO, filename="recording.wav", idempotency_key="saved-key", **options
         )
@@ -1209,7 +1065,7 @@ def test_bound_replay_validates_job_options(binding_path: str, changed_option: s
             assert caught.value.retryable is False
         replay_calls = service.calls[replay_start:]
         assert [request.method for request in replay_calls] == (
-            ["POST"] * (3 if binding_path == "refresh" else 2)
+            ["POST"] * (3 if grant_path == "refresh" else 2)
             + (["GET"] if changed_option is None else [])
         )
         assert len(service.submissions) == 2
@@ -1225,23 +1081,6 @@ def test_bound_replay_validates_job_options(binding_path: str, changed_option: s
         resume_start = len(service.calls)
         assert sdk.resume(original.job_id).job_id == original.job_id
         assert [request.method for request in service.calls[resume_start:]] == ["GET"]
-
-
-class InterruptedFile(io.BytesIO):
-    def read(self, size: int | None = -1) -> bytes:
-        raise KeyboardInterrupt
-
-
-def request_phase(request: httpx.Request) -> str:
-    if request.url.path.endswith("/uploads"):
-        return "upload_init"
-    if request.method == "PUT":
-        return "upload_put"
-    if request.method == "GET":
-        return "poll"
-    if request.url.path.endswith("/audio/transcriptions"):
-        return "sync_submit"
-    return "submit" if request.headers["content-type"] == "application/json" else "job_submit"
 
 
 INTERRUPT_CASES = [
@@ -1267,7 +1106,7 @@ def test_interrupt_is_ambiguous_only_for_unkeyed_sync(
         if request_phase(request) == phase:
             raise KeyboardInterrupt
         if request.method == "POST" and request.url.path.endswith("/transcription_jobs"):
-            return httpx.Response(202, json={"id": "job-1", "status": "queued"})
+            return accepted()
         return service(request)
 
     source = InterruptedFile(AUDIO) if phase == "prepare" else io.BytesIO(AUDIO)
@@ -1278,3 +1117,125 @@ def test_interrupt_is_ambiguous_only_for_unkeyed_sync(
     assert caught.value.ambiguous is (phase == "sync_submit")
     with pytest.raises(AttributeError):
         caught.value.ambiguous = False  # type: ignore[misc]
+
+    assert caught.value.job_id == ("job-1" if phase == "poll" else None)
+    assert caught.value.operation_key
+
+
+@pytest.mark.parametrize("limits", [Limits(), Limits(1, 2)])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_nonseekable_input_is_rejected_before_http(limits: Limits, asynchronous: bool) -> None:
+    source = ProbeFile(AUDIO, seekable=False)
+    with client(
+        lambda _: pytest.fail("unexpected HTTP"), limits=limits, asynchronous=asynchronous
+    ) as sdk:
+        with pytest.raises(ValueError, match="seekable"):
+            transcribe(sdk, file=source)
+    assert not source.closed
+
+
+@pytest.mark.parametrize("mode", ["inline", "sniff", "staged"])
+def test_preparation_deadline_restores_input_and_context(mode: str) -> None:
+    clock = Clock()
+    source = ProbeFile(
+        b"skip-fLaC" + AUDIO, on_read=lambda: clock.sleep(5 if mode == "staged" else 2)
+    )
+    source.seek(5)
+    with client(
+        lambda _: pytest.fail("unexpected HTTP"),
+        clock,
+        limits=Limits(1, 2) if mode == "staged" else Limits(),
+    ) as sdk:
+        with pytest.raises(DeadlineExceededError) as caught:
+            sdk.transcribe_file(
+                source,
+                model=MODEL,
+                deadline=1,
+                **({} if mode == "sniff" else {"content_type": "audio/wav"}),
+                idempotency_key="saved-key" if mode == "staged" else None,
+            )
+    assert caught.value.phase == ("upload_init" if mode == "staged" else "prepare")
+    assert caught.value.wait_for_file_release(1)
+    assert source.tell() == 5 and not source.closed
+    if mode == "staged":
+        context(caught.value, "upload_init", None)
+
+
+@pytest.mark.parametrize("mode,offset", [("inline", 6), ("job", 4), ("staged", 4)])
+def test_file_reads_are_bounded_and_restore_the_offset(mode: str, offset: int) -> None:
+    audio = AUDIO if mode == "staged" else b"fLaC" + b"a" * 200_000
+    source = ProbeFile(b"x" * offset + audio)
+    source.seek(offset)
+    service = Service()
+    posts: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if mode == "staged":
+            return service(request)
+        if request.method == "GET":
+            return completed()
+        posts.append(request.content)
+        if mode == "job":
+            assert b'filename="upload.flac"' in request.content
+            if len(posts) == 1:
+                raise httpx.ReadTimeout("lost")
+            return accepted()
+        return httpx.Response(200, json={"text": ""})
+
+    with client(handler, limits=Limits(1, 2) if mode == "staged" else Limits()) as sdk:
+        sdk.transcribe_file(
+            source,
+            model=MODEL,
+            **({"idempotency_key": "saved"} if mode == "job" else {"content_type": "audio/wav"}),
+        )
+    assert source.tell() == offset and not source.closed
+    if mode == "job":
+        assert posts[0] == posts[1]
+    if mode == "staged":
+        assert len(source.reads) == 2 * ((len(AUDIO) + 65535) // 65536) + 2
+        assert service.puts == [AUDIO]
+
+
+@pytest.mark.parametrize("boundary,delta", [("sync", 0), ("sync", 1), ("job", 0), ("job", 1)])
+def test_encoded_size_selects_transport_at_each_boundary(boundary: str, delta: int) -> None:
+    measured: list[httpx.Request] = []
+    with client(recorder(lambda _: httpx.Response(200, json={"text": ""}), measured)) as sdk:
+        sdk.transcribe_file(b"fLaC", model=MODEL)
+    size = len(measured[0].content)
+    limits = Limits(size - delta, size) if boundary == "sync" else Limits(1, size - delta)
+    service = Service()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/audio/transcriptions":
+            service.calls.append(request)
+            return httpx.Response(200, json={"text": ""})
+        if request.headers.get("content-type", "").startswith("multipart/"):
+            assert b'filename="upload.flac"' in request.content
+            assert int(request.headers["content-length"]) == len(request.content)
+        return service(request)
+
+    with client(handler, limits=limits) as sdk:
+        sdk.transcribe_file(b"fLaC", model=MODEL)
+    expected = (
+        "/v1/audio/transcriptions"
+        if boundary == "sync" and not delta
+        else ("/v1/uploads" if boundary == "job" and delta else "/v1/transcription_jobs")
+    )
+    assert service.calls[0].url.path == expected
+    assert bool(service.initializations) is (boundary == "job" and bool(delta))
+    if expected == "/v1/transcription_jobs":
+        assert len(service.calls) == 2
+
+
+def test_uploaded_content_type_for_every_suffix() -> None:
+    assert _SUFFIX_MIME_TYPES == {
+        ".wav": "audio/wav",
+        ".flac": "audio/flac",
+        ".ogg": "audio/ogg",
+        ".mp3": "audio/mpeg",
+        ".mpga": "audio/mpeg",
+        ".mpeg": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".mp4": "video/mp4",
+        ".webm": "audio/webm",
+    }

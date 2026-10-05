@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import builtins
 import hashlib
 import importlib.util
@@ -10,14 +11,35 @@ from typing import Any
 
 import httpx
 import pytest
-from test_client import API, CREDENTIAL, MODEL, Clock, client, completed
+from support import (
+    API,
+    CREDENTIAL,
+    MODEL,
+    Clock,
+    accepted,
+    client,
+    completed,
+    job_api,
+    queued,
+    recorder,
+)
 
 import machinera as m
+from machinera import _codes
 
 
-@pytest.mark.parametrize("key", [None, ""])
-def test_missing_credentials(monkeypatch: pytest.MonkeyPatch, key: str | None) -> None:
-    monkeypatch.delenv("MACHINERA_API_KEY", raising=False)
+@pytest.mark.parametrize(
+    "key,environment",
+    [(None, None), ("", None)]
+    + [(key, CREDENTIAL) for key in ["has space", "\x00", "\x7f", "nonascii-é"]],
+)
+def test_invalid_credentials_are_rejected(
+    monkeypatch: pytest.MonkeyPatch, key: str | None, environment: str | None
+) -> None:
+    if environment is None:
+        monkeypatch.delenv("MACHINERA_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("MACHINERA_API_KEY", environment)
     with pytest.raises(ValueError, match="api_key"):
         m.Machinera(api_key=key)
 
@@ -75,13 +97,7 @@ def test_method_timeout_mapping(
 ) -> None:
     seen = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        if request.url.path == "/v1/audio/transcriptions":
-            return httpx.Response(200, json={"text": ""})
-        if request.method == "POST":
-            return httpx.Response(202, json={"id": "job-1"})
-        return completed()
+    handler = recorder(job_api(sync=lambda request: httpx.Response(200, json={"text": ""})), seen)
 
     inherited = m.TimeoutPolicy(10, 11, 12, 13, 17, 19)
     if not options:
@@ -116,8 +132,8 @@ def test_deadline_override_with_disabled_phases(method: str) -> None:
         calls.append(request)
         assert all(v is None for v in request.extensions["timeout"].values())
         if request.method == "POST":
-            return httpx.Response(202, json={"id": "job-1"})
-        return httpx.Response(200, json={"id": "job-1", "status": "queued"})
+            return accepted()
+        return queued()
 
     with client(handler, clock, timeout=None) as sdk:
         with pytest.raises(m.DeadlineExceededError) as caught:
@@ -157,12 +173,6 @@ def test_retry_expansion(options: dict[str, Any], attempts: int) -> None:
     assert len(calls) == attempts and caught.value.retryable is True
 
 
-@pytest.mark.parametrize("value", [-1, 1.5, True, None])
-def test_invalid_retries(value: Any) -> None:
-    with pytest.raises(ValueError):
-        client(lambda _: completed(), max_retries=value)
-
-
 def test_configuration_conflicts() -> None:
     with pytest.raises(ValueError, match="max_retries"):
         client(lambda _: completed(), max_retries=2, retry_policy=m.RetryPolicy())
@@ -191,24 +201,6 @@ def test_invalid_durations(value: float) -> None:
                     method(b"fLaC", model=MODEL, deadline=value)
 
 
-@pytest.mark.parametrize(
-    "options",
-    [
-        {"max_attempts": True},
-        {"max_attempts": 1.5},
-        {"max_polls": 0},
-        {"max_polls": True},
-        {"initial_delay": 0},
-        {"max_delay": float("inf")},
-        {"poll_interval": -1},
-        {"initial_delay": 2, "max_delay": 1},
-    ],
-)
-def test_invalid_advanced_retries(options: dict[str, Any]) -> None:
-    with pytest.raises(ValueError):
-        m.RetryPolicy(**options)
-
-
 @pytest.mark.parametrize("jitter,expected", [(0, [0.375, 0.75, 0.75]), (1, [0.5, 1, 1])])
 def test_jitter_and_backoff_cap(jitter: float, expected: list[float]) -> None:
     clock = Clock()
@@ -226,28 +218,26 @@ def test_jitter_and_backoff_cap(jitter: float, expected: list[float]) -> None:
 
 
 @pytest.mark.parametrize(
-    "name",
+    "name,value",
     [
-        "AUTHORIZATION",
-        "Host",
-        "Content-Length",
-        "Content-Type",
-        "Idempotency-Key",
-        "Transfer-Encoding",
-        "X-cOnTeNt-Md5",
-        "bad name",
-        "X-\r\nInjected",
-    ],
+        (name, "value")
+        for name in [
+            "AUTHORIZATION",
+            "Host",
+            "Content-Length",
+            "Content-Type",
+            "Idempotency-Key",
+            "Transfer-Encoding",
+            "X-cOnTeNt-Md5",
+            "bad name",
+            "X-\r\nInjected",
+        ]
+    ]
+    + [("X-Note", value) for value in ["a\r\nb", "a\x00b", "a\x7fb", "é"]],
 )
-def test_invalid_default_headers(name: str) -> None:
+def test_invalid_default_headers(name: str, value: str) -> None:
     with pytest.raises(ValueError):
-        client(lambda _: pytest.fail("unexpected HTTP"), default_headers={name: "value"})
-
-
-@pytest.mark.parametrize("value", ["a\r\nb", "a\x00b", "a\x7fb", "é"])
-def test_invalid_header_values(value: str) -> None:
-    with pytest.raises(ValueError):
-        client(lambda _: completed(), default_headers={"X-Extra": value})
+        client(lambda _: pytest.fail("unexpected HTTP"), default_headers={name: value})
 
 
 def test_copied_headers_and_injected_client_defaults() -> None:
@@ -326,6 +316,15 @@ def test_status_errors_and_safe_body(status: int, kind: type[m.APIStatusError]) 
         error.status = 200
 
 
+def owned(
+    error: m.APIError, caller_key: bool | None, replay: bool = False, *, lost: bool = False
+) -> m.APIError:
+    error._caller_key = caller_key
+    error._sync_replay = replay
+    error._submission_lost = lost
+    return error
+
+
 @pytest.mark.parametrize(
     "error,transient",
     [
@@ -374,7 +373,7 @@ def test_status_errors_and_safe_body(status: int, kind: type[m.APIStatusError]) 
         (m.InternalServerError("x", status_code=503), False),
         (m.DeadlineExceededError("x", job_id="job-1"), True),
         (m.DeadlineExceededError("x"), False),
-        (m.TranscriptionInterrupted("x", job_id="job-1"), True),
+        (m.TranscriptionInterrupted("x", job_id="job-1"), False),
         (m.TranscriptionInterrupted("x", ambiguous=True), False),
         (m.AmbiguousSubmissionError("x", job_id="job-1"), False),
         (m.TerminalJobError("x", retryable=True, job_id="job-1"), False),
@@ -383,10 +382,47 @@ def test_status_errors_and_safe_body(status: int, kind: type[m.APIStatusError]) 
         (m.APIResponseValidationError("x"), False),
         (m.APIError("x", retryable=True), False),
         (m.MachineraError("x"), False),
+        (owned(m.DeadlineExceededError("x", phase="prepare"), False), True),
+        (owned(m.DeadlineExceededError("x", phase="upload_put"), False), False),
+        (owned(m.DeadlineExceededError("x", phase="upload_put"), True), True),
+        (owned(m.DeadlineExceededError("x", phase="poll", job_id="job-1"), None), True),
+        (owned(m.TranscriptionInterrupted("x", phase="prepare"), False), False),
+        (owned(m.TranscriptionInterrupted("x", phase="sync_submit"), False, True), False),
+        (owned(m.TranscriptionInterrupted("x", phase="job_submit"), True), False),
+        (owned(m.TranscriptionInterrupted("x", phase="poll", job_id="job-1"), None), False),
+        (owned(m.APITimeoutError("x", retryable=True, phase="submit"), False, lost=True), False),
+        (owned(m.APITimeoutError("x", retryable=True, phase="submit"), True, lost=True), True),
+        (owned(m.TerminalJobError("x", retryable=True, job_id="job-1"), False, lost=True), True),
+        (
+            owned(
+                m.InternalServerError(
+                    "x", status_code=503, retryable=True, phase="poll", job_id="job-1"
+                ),
+                None,
+            ),
+            True,
+        ),
+        (
+            owned(
+                m.InternalServerError(
+                    "x",
+                    status_code=503,
+                    code="inline_claim_timeout",
+                    retryable=True,
+                    phase="sync_submit",
+                ),
+                False,
+                replay=True,
+            ),
+            False,
+        ),
     ],
 )
 def test_is_transient_matrix(error: m.MachineraError, transient: bool) -> None:
     assert error.is_transient is transient
+
+
+FAILED = {"retryable": True, "job_id": "job-1"}
 
 
 @pytest.mark.parametrize(
@@ -411,23 +447,6 @@ def test_closed_client_is_not_transient(asynchronous: bool) -> None:
         with pytest.raises(m.APIConnectionError, match="closed") as caught:
             sdk.get_job("job-1")
     assert caught.value.is_transient is False
-
-
-@pytest.mark.parametrize(
-    "code,replay,transient",
-    [
-        (None, False, False),
-        (None, True, True),
-        ("inline_claim_timeout", True, False),
-        ("no_serving_capacity", True, True),
-    ],
-)
-def test_sync_replay_status_transience(code: str | None, replay: bool, transient: bool) -> None:
-    error = m.InternalServerError(
-        "x", status_code=503, code=code, retryable=True, phase="sync_submit"
-    )
-    error._sync_replay = replay
-    assert error.is_transient is transient
 
 
 def test_recoverable_job_errors_share_one_marker() -> None:
@@ -551,9 +570,12 @@ SIGNATURES = [
 ]
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("data,suffix", SIGNATURES)
 @pytest.mark.parametrize("form", ["bytes", "handle"])
-def test_signature_resolution(data: bytes, suffix: str, form: str) -> None:
+def test_signature_selects_the_media_suffix(
+    data: bytes, suffix: str, form: str, asynchronous: bool
+) -> None:
     handle = io.BytesIO(b"skip" + data)
     handle.seek(4)
     source = data if form == "bytes" else handle
@@ -566,7 +588,7 @@ def test_signature_resolution(data: bytes, suffix: str, form: str) -> None:
         assert int(request.headers["content-length"]) == len(request.content)
         return httpx.Response(200, json={"text": ""})
 
-    with client(handler) as sdk:
+    with client(handler, asynchronous=asynchronous) as sdk:
         assert sdk.transcribe_file(source, model=MODEL).text == ""
     assert handle.tell() == 4 and not handle.closed
 
@@ -589,7 +611,7 @@ def test_signature_resolution(data: bytes, suffix: str, form: str) -> None:
         ("Audio/WAV; charset=binary", "wav"),
     ],
 )
-def test_mime_resolution(mime: str, suffix: str) -> None:
+def test_content_type_selects_the_media_suffix(mime: str, suffix: str) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert f'filename="upload.{suffix}"'.encode() in request.content
         assert f"Content-Type: {mime}".encode() in request.content
@@ -600,9 +622,12 @@ def test_mime_resolution(mime: str, suffix: str) -> None:
         sdk.transcribe_file(b"unrecognized", model=MODEL, content_type=mime)
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize(
     "form",
     [
+        "unnamed_pair",
+        "unnamed_typed",
         "str",
         "path",
         "bytes",
@@ -616,11 +641,13 @@ def test_mime_resolution(mime: str, suffix: str) -> None:
         "numeric_name",
     ],
 )
-def test_file_forms(tmp_path: Path, form: str) -> None:
+def test_every_file_form_names_the_part(tmp_path: Path, form: str, asynchronous: bool) -> None:
     path = tmp_path / "clip.wav"
     path.write_bytes(b"fLaC")
     handle = io.BytesIO(b"fLaC")
     forms: dict[str, Any] = {
+        "unnamed_pair": (None, b"fLaC"),
+        "unnamed_typed": (None, b"fLaC", "audio/flac"),
         "str": str(path),
         "path": path,
         "bytes": b"fLaC",
@@ -635,15 +662,20 @@ def test_file_forms(tmp_path: Path, form: str) -> None:
     }
     if form in ("handle_name", "numeric_name"):
         handle.name = path if form == "handle_name" else 5
-    expected = "upload.flac" if form in ("handle", "numeric_name") else "clip.wav"
+    expected = (
+        "upload.flac"
+        if form in ("handle", "numeric_name", "unnamed_pair", "unnamed_typed")
+        else "clip.wav"
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert f'filename="{expected}"'.encode() in request.content
+        assert b"fLaC" in request.content
         if form == "quad":
             assert b"x-part: value\r\n" in request.content and "x-part" not in request.headers
         return httpx.Response(200, json={"text": ""})
 
-    with client(handler) as sdk:
+    with client(handler, asynchronous=asynchronous) as sdk:
         sdk.transcribe_file(
             forms[form], model=MODEL, **({"filename": "clip.wav"} if form == "bytes" else {})
         )
@@ -656,9 +688,12 @@ def test_supported_explicit_suffixes(suffix: str) -> None:
         sdk.transcribe_file(b"raw", model=MODEL, filename=f"clip.{suffix.upper()}")
 
 
+@pytest.mark.parametrize("handle", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize(
     "data",
     [
+        b"unknown content",
         b"",
         b"raw",
         b"RIF",
@@ -669,6 +704,7 @@ def test_supported_explicit_suffixes(suffix: str) -> None:
         b"\xff\xff\xff\xff",
         b"\xff\xe8\x90\x00",
         b"\xff\xfb\x9c\x00",
+        b"\x00\x00\x00\x14ftypavif\x00\x00\x00\x00isom",
         b"\x00\x00\x00\x10ftypqt 0000",
         b"\x00\x00\x00\x20ftypmp42",
         b"\x1a\x45\xdf\xa3",
@@ -676,17 +712,29 @@ def test_supported_explicit_suffixes(suffix: str) -> None:
         b"\x1a\x45\xdf\xa3\x8bgarbagewebm",
     ],
 )
-def test_unrecognized_signature_before_http(data: bytes) -> None:
-    with client(lambda _: pytest.fail("unexpected HTTP")) as sdk:
+def test_unrecognized_signature_before_http(data: bytes, asynchronous: bool, handle: bool) -> None:
+    source = io.BytesIO(b"skip " + data) if handle else data
+    if handle:
+        source.seek(5)
+    with client(lambda _: pytest.fail("unexpected HTTP"), asynchronous=asynchronous) as sdk:
         with pytest.raises(ValueError) as caught:
-            sdk.transcribe_file(data, model=MODEL)
+            sdk.transcribe_file(source, model=MODEL)
     assert "filename=" in str(caught.value) and "content_type=" in str(caught.value)
     assert all(s in str(caught.value) for s in m.SUPPORTED_MEDIA_SUFFIXES)
 
+    if handle:
+        assert source.tell() == 5 and not source.closed
 
+
+@pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize(
     "source,options",
     [
+        (b"unknown", {}),
+        (b"RIFF", {}),
+        (b"audio", {"filename": "bad.txt"}),
+        (b"audio", {"content_type": "unknown/type"}),
+        (("a.wav", b"audio"), {"filename": "b.wav"}),
         (b"fLaC", {"filename": "clip.bin"}),
         (b"fLaC", {"content_type": "application/octet-stream"}),
         (("a.wav", b"fLaC"), {"filename": "b.wav"}),
@@ -696,8 +744,10 @@ def test_unrecognized_signature_before_http(data: bytes) -> None:
         (b"fLaC", {"content_type": "audio/wav\r\nX: bad"}),
     ],
 )
-def test_invalid_metadata_before_http(source: Any, options: dict[str, Any]) -> None:
-    with client(lambda _: pytest.fail("unexpected HTTP")) as sdk:
+def test_invalid_metadata_before_http(
+    source: Any, options: dict[str, Any], asynchronous: bool
+) -> None:
+    with client(lambda _: pytest.fail("unexpected HTTP"), asynchronous=asynchronous) as sdk:
         with pytest.raises(ValueError):
             sdk.transcribe_file(source, model=MODEL, **options)
 
@@ -718,60 +768,6 @@ def test_reject_part_framing_and_sensitive_headers(header: str) -> None:
     with client(lambda _: pytest.fail("unexpected HTTP")) as sdk:
         with pytest.raises(ValueError):
             sdk.transcribe_file(("clip.wav", b"data", None, {header: "bad"}), model=MODEL)
-
-
-def test_sniffing_bounded_and_replayed() -> None:
-    class BoundedFile(io.BytesIO):
-        def read(self, size: int = -1) -> bytes:
-            assert 0 < size <= 64 * 1024
-            return super().read(size)
-
-    source = BoundedFile(b"skipfLaC" + b"a" * 200_000)
-    source.seek(4)
-    posts = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
-            return completed()
-        posts.append(request.content)
-        assert b'filename="upload.flac"' in request.content
-        if len(posts) == 1:
-            raise httpx.ReadTimeout("lost")
-        return httpx.Response(202, json={"id": "job-1"})
-
-    with client(handler) as sdk:
-        sdk.transcribe_file(source, model=MODEL, idempotency_key="saved")
-    assert posts[0] == posts[1] and source.tell() == 4 and not source.closed
-
-
-def test_sniffing_preparation_deadline() -> None:
-    clock = Clock()
-
-    class SlowPrefix(io.BytesIO):
-        def read(self, size: int = -1) -> bytes:
-            clock.now += 2
-            return super().read(size)
-
-    source = SlowPrefix(b"fLaC")
-    with client(lambda _: pytest.fail("unexpected HTTP"), clock) as sdk:
-        with pytest.raises(m.DeadlineExceededError) as caught:
-            sdk.transcribe_file(source, model=MODEL, deadline=1)
-    assert caught.value.phase == "prepare" and not source.closed
-    assert caught.value.wait_for_file_release(1)
-
-
-@pytest.mark.parametrize("key", ["has space", "\x00", "\x7f", "nonascii-é"])
-def test_invalid_explicit_credential(key: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("MACHINERA_API_KEY", CREDENTIAL)
-    with pytest.raises(ValueError):
-        m.Machinera(api_key=key)
-
-
-def test_unrelated_container_with_generic_compatibility() -> None:
-    data = b"\x00\x00\x00\x14ftypavif\x00\x00\x00\x00isom"
-    with client(lambda _: pytest.fail("unexpected HTTP")) as sdk:
-        with pytest.raises(ValueError):
-            sdk.transcribe_file(data, model=MODEL)
 
 
 def test_metadata_precedence_and_matching_tuple_values(tmp_path: Path) -> None:
@@ -795,15 +791,6 @@ def test_metadata_precedence_and_matching_tuple_values(tmp_path: Path) -> None:
     assert all(b"Content-Type: audio/flac" in body for body in names)
 
 
-def test_sniff_failure_restores_offset() -> None:
-    handle = io.BytesIO(b"skip unknown content")
-    handle.seek(5)
-    with client(lambda _: pytest.fail("unexpected HTTP")) as sdk:
-        with pytest.raises(ValueError):
-            sdk.transcribe_file(handle, model=MODEL)
-    assert handle.tell() == 5 and not handle.closed
-
-
 @pytest.mark.parametrize("timeout", [httpx.Timeout(-1), httpx.Timeout(float("inf")), True, "10"])
 def test_invalid_timeout_forms(timeout: Any) -> None:
     with pytest.raises((ValueError, TypeError)):
@@ -811,36 +798,6 @@ def test_invalid_timeout_forms(timeout: Any) -> None:
     with client(lambda _: pytest.fail("unexpected HTTP")) as sdk:
         with pytest.raises((ValueError, TypeError)):
             sdk.resume("job-1", timeout=timeout)
-
-
-def test_custom_limits_select_inline_job_by_encoded_size() -> None:
-    seen = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        if request.method == "POST":
-            assert request.url.path == "/v1/transcription_jobs"
-            assert b'filename="upload.flac"' in request.content
-            assert int(request.headers["content-length"]) == len(request.content)
-            return httpx.Response(202, json={"id": "job-1"})
-        return completed()
-
-    with client(handler, limits=m.Limits(1, 1024, 512)) as sdk:
-        sdk.transcribe_file(b"fLaC", model=MODEL)
-    assert len(seen) == 2
-
-
-def test_failed_trace_does_not_interrupt_transport_cleanup() -> None:
-    from machinera._io import Exchange
-
-    def expired() -> None:
-        raise m.DeadlineExceededError("expired")
-
-    with httpx.Client() as http:
-        exchange = Exchange(http, httpx.Request("GET", API), expired, lambda: None)
-        exchange.trace("http11.receive_response_body.failed", {"exception": GeneratorExit()})
-        with pytest.raises(m.DeadlineExceededError):
-            exchange.trace("http11.receive_response_body.started", {})
 
 
 @pytest.mark.parametrize("form", ["path", "handle"])
@@ -885,3 +842,67 @@ def test_unsupported_explicit_names_never_fall_back(
                 filename=name if form == "keyword" else None,
                 content_type=content_type,
             )
+
+
+def test_every_referenced_error_code_exists() -> None:
+    for path in Path(m.__file__).parent.glob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "_codes"
+            ):
+                assert hasattr(_codes, node.attr), f"{path.name}:{node.lineno}: {node.attr}"
+
+
+def test_unrecognized_content_type_is_rejected_only_for_unnamed_input() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"text": "hi"})
+
+    WAV = b"RIFF\x24\x00\x00\x00WAVEfmt " + bytes(64)
+    with m.Machinera(api_key="key", transport=httpx.MockTransport(handler)) as client:
+        unknown = "application/octet-stream"
+        named = client.transcribe_file(
+            ("clip.wav", WAV), model="transcribe-v1", content_type=unknown
+        )
+        assert named.text == "hi"
+        assert client.transcribe_file(WAV, model="transcribe-v1").text == "hi"
+        assert len(requests) == 2
+        # The same WAV bytes, unnamed: the unknown type is not replaced by signature inspection.
+        with pytest.raises(ValueError):
+            client.transcribe_file(WAV, model="transcribe-v1", content_type=unknown)
+        assert len(requests) == 2
+
+
+INVALID_CONFIG = [
+    lambda: m.RetryPolicy(max_attempts=0),
+    lambda: m.RetryPolicy(max_delay=0.1),
+    lambda: m.TimeoutPolicy(deadline=float("inf")),
+    lambda: m.TimeoutPolicy(read=0),
+    lambda: m.Limits(2, 1),
+    lambda: m.Machinera(api_key=CREDENTIAL, base_url="https://api.example/v2"),
+    lambda: m.Machinera(api_key=CREDENTIAL, base_url="https://api.example/v1?key=x"),
+    lambda: m.Machinera(api_key=CREDENTIAL, base_url="https://user:pass@api.example/v1"),
+    lambda: m.Machinera(api_key=CREDENTIAL, base_url="ftp://api.example/v1"),
+    lambda: client(lambda _: completed(), max_retries=-1),
+    lambda: client(lambda _: completed(), max_retries=1.5),
+    lambda: client(lambda _: completed(), max_retries=True),
+    lambda: client(lambda _: completed(), max_retries=None),
+    lambda: m.RetryPolicy(**{"max_attempts": True}),
+    lambda: m.RetryPolicy(**{"max_attempts": 1.5}),
+    lambda: m.RetryPolicy(**{"max_polls": 0}),
+    lambda: m.RetryPolicy(**{"max_polls": True}),
+    lambda: m.RetryPolicy(**{"initial_delay": 0}),
+    lambda: m.RetryPolicy(**{"max_delay": float("inf")}),
+    lambda: m.RetryPolicy(**{"poll_interval": -1}),
+    lambda: m.RetryPolicy(**{"initial_delay": 2, "max_delay": 1}),
+]
+
+
+@pytest.mark.parametrize("factory", INVALID_CONFIG)
+def test_invalid_configuration_is_rejected(factory: Any) -> None:
+    with pytest.raises(ValueError):
+        factory()

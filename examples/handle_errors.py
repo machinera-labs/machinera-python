@@ -9,59 +9,48 @@ from machinera import (
     AmbiguousSubmissionError,
     APIConnectionError,
     APIError,
-    APIResponseValidationError,
-    AuthenticationError,
-    BadRequestError,
+    APIStatusError,
     ConflictError,
-    DeadlineExceededError,
-    InternalServerError,
     Machinera,
     NotFoundError,
-    PayloadTooLargeError,
-    PermissionDeniedError,
-    RateLimitError,
+    RecoverableJobError,
     TerminalJobError,
     TranscriptionInterrupted,
-    UnprocessableEntityError,
-    UploadError,
 )
 
-RECONCILE = "Execution may have started. Reconcile the operation before submitting again."
-REPEAT = "Repeat the identical call with idempotency_key set to the error's operation key."
+FAILURE_TABLE = (
+    "https://github.com/machinera-labs/machinera-python/blob/main/api.md#failure-handling"
+)
 
 
 def recovery_guidance(error: APIError) -> str:
-    if isinstance(error, TerminalJobError):
-        return "The job failed. Review the failure before deciding whether to create a new job."
-    if isinstance(error, AmbiguousSubmissionError):
-        return RECONCILE
-    if isinstance(error, (AuthenticationError, PermissionDeniedError)):
-        return "Check the API key and its permissions before retrying."
-    if isinstance(error, (BadRequestError, UnprocessableEntityError, PayloadTooLargeError)):
-        return "Correct the input or configured limits before retrying."
-    if isinstance(error, UploadError):
-        return "Keep the file unchanged and follow the large-file recovery steps."
-    if isinstance(error, TranscriptionInterrupted) and error.ambiguous:
-        return RECONCILE
-    if error.phase == "sync_submit" and not isinstance(error, RateLimitError):
-        return RECONCILE
-    if isinstance(error, (NotFoundError, ConflictError)):
-        return "The job or key cannot be found or replayed. Reconcile; do not use a new key."
-    if error.job_id is not None:
-        return "Preserve the job ID privately and resume that job; do not submit a replacement."
-    if isinstance(error, (RateLimitError, InternalServerError)):
-        return "Safe retries were exhausted. Pause first. " + REPEAT
-    if isinstance(
-        error,
-        (
-            DeadlineExceededError,
-            TranscriptionInterrupted,
-            APIConnectionError,
-            APIResponseValidationError,
-        ),
+    if isinstance(error, TranscriptionInterrupted):
+        action = "Row 1: stop and save recovery context."
+        if error.ambiguous:
+            action += " Execution may have started; see row 4."
+    elif isinstance(error, TerminalJobError):
+        action = "Row 2: the job failed; never resume it."
+    elif error.job_id is not None:
+        if error.retryable is not True and (
+            isinstance(error, (NotFoundError, ConflictError))
+            or 400 <= (error.status_code or 0) < 500
+        ):
+            action = "Row 3: permanent for this job (row 7)."
+        else:
+            action = "Row 3: resume that job within your retry budget."
+    elif isinstance(error, AmbiguousSubmissionError):
+        action = "Row 4: execution may have started; repeating may charge again."
+    elif isinstance(error, RecoverableJobError) or (
+        isinstance(error, (APIConnectionError, APIStatusError))
+        and error.retryable is True
+        and error.phase in ("job_submit", "submit")
     ):
-        return "Admission was not confirmed. " + REPEAT
-    return "The service refused the operation. Inspect the error code and reconcile first."
+        action = "Row 5: recover by phase and saved operation key."
+    elif error.is_transient:
+        action = "Row 6: pause before repeating the identical call with the same key."
+    else:
+        action = "Row 7: permanent for this input."
+    return f"{action} Follow {FAILURE_TABLE}"
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -1,5 +1,5 @@
 """Generated service contract; do not edit."""
-# contract-sha256: 43b8e78037da4b5fd72cfd81a25161203cb14925a390736e9f8de3370551353c
+# contract-sha256: 7bf6ce4dad84e24d06de5206f03deb6a3e9764e2fbfc92127aada0e849d891cf
 
 from collections.abc import Mapping
 from typing import NamedTuple
@@ -493,6 +493,30 @@ RETRYABLE_CODES: frozenset[str] = frozenset(
 TERMINAL_CODES: frozenset[str] = frozenset(
     code for code, entry in ERROR_CODES.items() if not entry.retryable
 )
+
+# Public job statuses.
+JOB_STATUSES: tuple[str, ...] = ("queued", "processing", "completed", "error")
+
+# Pending job statuses.
+PENDING_JOB_STATUSES: frozenset[str] = frozenset({"processing", "queued"})
+
+# Terminal job statuses.
+TERMINAL_JOB_STATUSES: frozenset[str] = frozenset({"completed", "error"})
+
+# Published model aliases.
+PUBLISHED_MODEL_ALIASES: tuple[str, ...] = ("transcribe-v1",)
+
+# Upload grant states.
+UPLOAD_GRANT_STATES: tuple[str, ...] = ("pending", "admitting", "bound", "expired", "reclaimed")
+
+# Idempotency key header.
+IDEMPOTENCY_KEY_HEADER: str = "Idempotency-Key"
+
+# Request content checksum header.
+CONTENT_MD5_HEADER: str = "X-Content-MD5"
+
+# Retry delay header.
+RETRY_AFTER_HEADER: str = "Retry-After"
 
 # Accepted media suffixes.
 SUPPORTED_MEDIA_SUFFIXES: frozenset[str] = frozenset(

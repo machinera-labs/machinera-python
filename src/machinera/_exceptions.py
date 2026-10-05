@@ -35,12 +35,24 @@ def retry_eligible(
     retryable: bool | None,
     replay_safe: bool,
     replay_after_send: bool = False,
+    guidance: bool | None = None,
 ) -> bool:
     """Whether a received error response may be retried; the retry loop and is_transient agree.
 
     replay_after_send (sync_replay="always") also replays a synchronous request after any
-    retryable response, except the job-fallback codes, whose handling it leaves unchanged.
+    retryable response, and after any 5xx unless the service's own guidance is False,
+    except the job-fallback codes, whose handling it leaves unchanged. guidance is the
+    explicit retryable flag in the response, or None when it carried none.
     """
+    if (
+        replay_after_send
+        and not replay_safe
+        and status is not None
+        and 500 <= status < 600
+        and guidance is not False
+        and code not in SYNC_FALLBACK_CODES
+    ):
+        return True
     replayable = (
         replay_safe
         or status == 429
@@ -48,6 +60,12 @@ def retry_eligible(
         or (replay_after_send and code not in SYNC_FALLBACK_CODES)
     )
     return replayable and retryable is True and status not in (401, 403)
+
+
+def explicit_guidance(body: object) -> bool | None:
+    """The explicit retryable flag a service response carried, or None."""
+    value = body.get("retryable") if isinstance(body, dict) else None
+    return value if isinstance(value, bool) else None
 
 
 def connection_replayable(unsent: bool, replay_safe: bool, replay_after_send: bool) -> bool:
@@ -63,37 +81,47 @@ class MachineraError(Exception):
 
     @property
     def is_transient(self) -> bool:
-        """True when trying again later may succeed; never True where the SDK refuses to retry.
-
-        A RecoverableJobError is transient only with a job_id: resume that job. A status
-        error is transient when the SDK's own retry rule would retry it, treating the
-        "sync_submit" phase as not replay-safe. A connection error in that phase is
-        transient when the retry loop marked it retryable via connection_replayable,
-        including after-send failures under sync_replay="always"; under that policy a
-        retryable status response in that phase follows retry_eligible's replay rule.
-        A local failure (file I/O or a closed client) is never transient.
+        """True when repeating the identical call, as made, is safe and may succeed.
+        See api.md#machineraerror for the decision table.
         """
+        if isinstance(self, TranscriptionInterrupted):
+            return False
+        sdk_key = getattr(self, "_caller_key", None) is False
+        lost = getattr(self, "_submission_lost", False)
+        if sdk_key and lost and getattr(self, "job_id", None) is None:
+            return False
         if isinstance(self, RecoverableJobError):
-            return self.job_id is not None
+            if self.job_id is not None:
+                return not sdk_key
+            phase = getattr(self, "phase", None)
+            if phase in ("prepare", "concurrency_wait"):
+                return True
+            if phase == "sync_submit":
+                return bool(getattr(self, "_sync_replay", False))
+            return getattr(self, "_caller_key", None) is True
         if not isinstance(self, APIError) or self._local:
+            return False
+        if isinstance(self, TerminalJobError):
+            return self.retryable is True and sdk_key
+        if self.job_id is not None and sdk_key:
             return False
         unsent = self.phase != "sync_submit"
         if isinstance(self, APIConnectionError):
             return self.retryable is True or (self.retryable is None and unsent)
         if isinstance(self, APIStatusError):
             return retry_eligible(
-                self.status_code, self.code, self.retryable, unsent, self._sync_replay
+                self.status_code,
+                self.code,
+                self.retryable,
+                unsent,
+                self._sync_replay,
+                explicit_guidance(self.body),
             )
         return False
 
 
 class RecoverableJobError(MachineraError):
-    """Marker for a call that ended while its job may still run; resume job_id when set.
-
-    job_id is None when no job ID was observed. The job may still have been accepted
-    (its response can be lost), so recover by repeating the identical call with
-    idempotency_key=operation_key, never with a fresh key.
-    """
+    """Recovery context for an unfinished call; see api.md failure-table rows 3 and 5."""
 
     job_id: str | None
 
@@ -138,6 +166,8 @@ class APIError(MachineraError):
         self._inline_cap: int | None = None
         self._local = False
         self._sync_replay = False
+        self._caller_key: bool | None = None
+        self._submission_lost = False
 
     def __str__(self) -> str:
         text = super().__str__()
@@ -206,19 +236,11 @@ class APIResponseValidationError(APIError):
 
 
 class DeadlineExceededError(APIError, RecoverableJobError):
-    """Call budget exhausted; resume job_id when set, as the job may still be running.
-
-    With phase "sync_submit", reconcile instead of resubmitting under the default
-    sync_replay="never"; under sync_replay="always" the call may be repeated. Otherwise
-    repeat the identical call with idempotency_key=operation_key; never use a fresh key.
-    """
+    """Call budget exhausted; see api.md failure-table rows 3 and 5 for resume guidance."""
 
 
 class AmbiguousSubmissionError(APIError):
-    """An unkeyed synchronous request may have run; there is no job to resume.
-
-    Reconcile instead of resubmitting with either a new or the reported key.
-    """
+    """A synchronous request may have run with no job to resume; see api.md failure-table row 4."""
 
 
 class TerminalJobError(APIError):
@@ -238,10 +260,7 @@ class TerminalIntegrityError(IntegrityError, TerminalJobError):
 
 
 class TranscriptionInterrupted(APIError, RecoverableJobError, KeyboardInterrupt):
-    """Interrupted call; resume job_id when set, and reconcile when ambiguous is True.
-
-    Otherwise repeat the identical call with idempotency_key=operation_key.
-    """
+    """Interrupted call; see api.md failure-table row 1 for recovery guidance."""
 
     def __init__(self, message: str, *, ambiguous: bool = False, **context: Any) -> None:
         super().__init__(message, **context)
@@ -249,5 +268,13 @@ class TranscriptionInterrupted(APIError, RecoverableJobError, KeyboardInterrupt)
 
     @property
     def ambiguous(self) -> bool:
-        """True when an unkeyed synchronous request may have run; reconcile, never resubmit."""
+        """Whether a synchronous request may have run; see api.md failure-table rows 1 and 4."""
         return self._ambiguous
+
+
+def invalid_response(message: str, status_code: int) -> APIResponseValidationError:
+    return APIResponseValidationError(message, status_code=status_code, retryable=False)
+
+
+def expired_upload(message: str = "Upload has expired; recover any accepted job") -> UploadError:
+    return UploadError(message, code=_codes.upload_expired.code, retryable=False)

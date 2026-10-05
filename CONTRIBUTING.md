@@ -9,8 +9,12 @@ other private data. Report vulnerabilities through [SECURITY.md](SECURITY.md).
 ## Development
 
 Fork the [public repository](https://github.com/machinera-labs/machinera-python),
-clone your fork, and create a branch for the change. Python 3.12 is the development
-default in `.python-version`; CI tests Python 3.10, 3.11, 3.12, 3.13, and 3.14.
+clone your fork, and create a branch for the change. See
+[`.python-version`](.python-version) for the development Python version,
+[`ci.yml`](.github/workflows/ci.yml) for what CI runs, and
+[`publish.yml`](.github/workflows/publish.yml) for when it runs before publication.
+Run `uv run ruff check . && uv run ruff format --check . &&
+uv run mypy --strict src && uv run pytest -q` locally before asking for review.
 
 ```sh
 uv sync --locked --group dev
