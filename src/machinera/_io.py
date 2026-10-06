@@ -15,6 +15,38 @@ import httpx
 
 from ._exceptions import DeadlineExceededError
 
+# Bounds cancellation detection while a daemon is inside blocking user or network I/O.
+_CANCEL_INTERVAL = 0.05
+
+
+class Cancellation:
+    """One-way event with a reentrant lock for Python main-thread signal handlers."""
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition(threading.RLock())
+        self.cancelled = False
+
+    def set(self) -> None:
+        with self.condition:
+            self.cancelled = True
+            self.condition.notify_all()
+
+    def check(self) -> None:
+        if self.cancelled:
+            raise KeyboardInterrupt
+
+    def wait(self, delay: float) -> None:
+        end = time.monotonic() + delay
+        with self.condition:
+            while not self.cancelled:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    return
+                # A signal can notify reentrantly just before wait releases the lock.
+                self.condition.wait(min(remaining, _CANCEL_INTERVAL))
+        self.check()
+
+
 _T = TypeVar("_T")
 _storage_exchange: ContextVar[bool] = ContextVar("machinera_storage_exchange", default=False)
 _driver: ContextVar[Exchange | None] = ContextVar("machinera_exchange", default=None)
@@ -112,7 +144,9 @@ def run_bounded(
     finished: Callable[[], None],
     *,
     starting: Callable[[], None] = lambda: None,
+    interrupted: Callable[[], None] = lambda: None,
 ) -> _T:
+    interrupted()
     done = threading.Event()
     startup = threading.Lock()
     abandoned = False
@@ -142,8 +176,13 @@ def run_bounded(
             finished()
             raise
     try:
-        if not done.wait(max(0, stop - time.monotonic())):
-            raise expired()
+        while not done.is_set():
+            interrupted()
+            remaining = stop - time.monotonic()
+            if remaining <= 0:
+                raise expired()
+            done.wait(min(remaining, _CANCEL_INTERVAL))
+        interrupted()
         if errors:
             raise errors[0]
         if time.monotonic() >= stop:
@@ -191,13 +230,15 @@ class Exchange:
         self.abort_body = abort_body
         self.cancelled = threading.Event()
         self.lock = threading.Lock()
+        # Custom stream.close() may block; it must not hold up recovery metadata.
+        self.network_lock = threading.Lock()
         self.response: httpx.Response | None = None
         self.network: Any = None
         self.content = bytearray()
         self.request.extensions["trace"] = self.trace
 
     def trace(self, event: str, info: dict[str, Any]) -> None:
-        with self.lock:
+        with self.network_lock:
             if event in ("connection.connect_tcp.complete", "connection.start_tls.complete"):
                 self.network = info.get("return_value")
             if event.startswith("http2.") or event.endswith("response_closed.started"):
@@ -206,7 +247,7 @@ class Exchange:
             self._check()
 
     def claim(self, network: httpcore.NetworkStream) -> None:
-        with self.lock:
+        with self.network_lock:
             if self.cancelled.is_set():
                 raise DeadlineExceededError("HTTP exchange cancelled")
             self.network = network
@@ -237,12 +278,12 @@ class Exchange:
             return buffered(response, self.content, self.request)
         finally:
             # Clear ownership before the connection can return to the shared pool.
-            with self.lock:
+            with self.network_lock:
                 self.network = None
             response.close()
 
     def _close(self) -> None:
-        with self.lock:
+        with self.network_lock:
             if self.network is not None:
                 with suppress(Exception):
                     connection = self.network.get_extra_info("socket")
@@ -250,6 +291,7 @@ class Exchange:
                         connection.shutdown(socket.SHUT_RDWR)
                     self.network.close()
                 self.network = None
+        with self.lock:
             response = self.response
         if response is not None:
             with suppress(Exception):
@@ -261,7 +303,18 @@ class Exchange:
             self.abort_body()
         threading.Thread(target=self._close, daemon=True).start()
 
-    def run(self, budget: float, expired: Callable[[], BaseException]) -> httpx.Response:
+    def run(
+        self,
+        budget: float,
+        expired: Callable[[], BaseException],
+        interrupted: Callable[[], None] = lambda: None,
+    ) -> httpx.Response:
         return run_bounded(
-            self._send, budget, expired, self.cancel, self.finished, starting=self.starting
+            self._send,
+            budget,
+            expired,
+            self.cancel,
+            self.finished,
+            starting=self.starting,
+            interrupted=interrupted,
         )

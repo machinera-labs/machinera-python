@@ -1,5 +1,5 @@
 """Generated service contract; do not edit."""
-# contract-sha256: 7bf6ce4dad84e24d06de5206f03deb6a3e9764e2fbfc92127aada0e849d891cf
+# contract-sha256: 1dd2af2e8ce2a9215cbf5012b99fb41c9be060b3fe9267d27dae2486ed39fb5c
 
 from collections.abc import Mapping
 from typing import NamedTuple
@@ -505,6 +505,12 @@ TERMINAL_JOB_STATUSES: frozenset[str] = frozenset({"completed", "error"})
 
 # Published model aliases.
 PUBLISHED_MODEL_ALIASES: tuple[str, ...] = ("transcribe-v1",)
+
+# Default result retention in seconds; guaranteed minimum, may lengthen but never shorten.
+DEFAULT_RESULT_RETENTION_S: int = 259200
+
+# Default idempotency replay window in seconds; guaranteed minimum, may lengthen but never shorten.
+DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S: int = 86400
 
 # Upload grant states.
 UPLOAD_GRANT_STATES: tuple[str, ...] = ("pending", "admitting", "bound", "expired", "reclaimed")

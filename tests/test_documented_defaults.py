@@ -18,9 +18,15 @@ import support
 from support import Clock, Service, accepted, completed, failed_job, queued, unavailable
 
 import machinera
-from machinera._contract import DEFAULT_INLINE_CAP_BYTES, ERROR_CODES
+from machinera._contract import (
+    DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S,
+    DEFAULT_INLINE_CAP_BYTES,
+    DEFAULT_RESULT_RETENTION_S,
+    ERROR_CODES,
+)
 from machinera._exceptions import SYNC_FALLBACK_CODES, SYNC_REPLAYABLE_CODES
 from machinera._files import _MIME_SUFFIXES, _RESERVED
+from machinera._io import _CANCEL_INTERVAL
 
 ROOT = Path(__file__).resolve().parents[1]
 README = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -55,16 +61,93 @@ def documented(text: str) -> dict[str, str]:
     return {name: value.replace(",", "") for name, value in rows}
 
 
-@pytest.mark.parametrize("document", [README, REFERENCE], ids=["readme", "reference"])
-def test_documented_defaults_match_the_sdk(document: str) -> None:
-    assert documented(document) == expected_defaults()
-    assert table(README, "| Setting | Default | Meaning |") == table(
-        REFERENCE, "| Setting | Default | Meaning |"
+def test_documented_defaults_match_the_sdk() -> None:
+    assert documented(REFERENCE) == expected_defaults()
+
+
+def test_readme_links_to_authoritative_defaults() -> None:
+    section = README.split("## Deadlines and retries\n", 1)[1].split("\n## ", 1)[0]
+    assert "api.md#defaults)" in section
+    assert "| Setting | Default | Meaning |" not in README
+
+
+def test_retention_defaults_are_reexported_from_the_contract() -> None:
+    assert machinera.DEFAULT_RESULT_RETENTION_S is machinera._contract.DEFAULT_RESULT_RETENTION_S
+    assert (
+        machinera.DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S
+        is machinera._contract.DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S
+    )
+    assert {"DEFAULT_RESULT_RETENTION_S", "DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S"} <= set(
+        machinera.__all__
     )
 
 
+def test_readme_retention_cites_constants_without_copied_durations() -> None:
+    recovery = README.split("## Recovery after a restart\n", 1)[1].split("\n## ", 1)[0]
+    assert "`machinera.DEFAULT_RESULT_RETENTION_S`" in recovery
+    assert "`machinera.DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S`" in recovery
+    assert not re.search(
+        r"\b(?:\d+(?:[.,]\d+)*|(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten)\b)"
+        r"[\s-]*(?:days?|hours?|seconds?|d|h|s)\b",
+        recovery,
+        re.IGNORECASE,
+    )
+
+
+def test_retention_constants_availability_cites_changelog() -> None:
+    symbols = ("DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S", "DEFAULT_RESULT_RETENTION_S")
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    added_sections = re.findall(r"(?ms)^### Added\n(.*?)(?=^#{1,3} |\Z)", changelog)
+    matches = [section for section in added_sections if all(name in section for name in symbols)]
+    assert len(matches) == 1, "one Added section must document both retention constants"
+
+    recovery = README.split("- Recovery is limited", 1)[1].split("\n- ", 1)[0]
+    changelog_url = "https://github.com/machinera-labs/machinera-python/blob/main/CHANGELOG.md"
+    sections = [(recovery, changelog_url)]
+    for symbol in symbols:
+        section = REFERENCE.split(f"### `{symbol}`\n", 1)[1].split("\n##", 1)[0]
+        sections.append((section, "CHANGELOG.md"))
+    for section, target in sections:
+        assert "availability" in section.lower()
+        assert re.search(rf"\[[^\]]+\]\({re.escape(target)}\)", section)
+        assert not re.search(r"\bunreleased\b|\bv?\d+\.\d+(?:\.\d+)?\b", section, re.IGNORECASE)
+
+
+def test_readme_long_jobs_qualifies_collection_with_retention() -> None:
+    section = README.split("- **Long jobs:**", 1)[1].split("\n- **", 1)[0]
+    assert "to collect it while the [replay binding and result retention]" in section
+    assert "api.md#retention-defaults) hold" in section
+
+
+@pytest.mark.parametrize(
+    ("section", "start", "end"),
+    [
+        ("- **Billed once:**", "are guaranteed:", "Include any time"),
+        ("- Recovery is limited", "For accepted jobs, size", "Recovery does not extend retention."),
+    ],
+)
+def test_retention_recovery_claim_scopes_accepted_jobs_and_cites_upload_expiry(
+    section: str, start: str, end: str
+) -> None:
+    text = README.split(section, 1)[1].split("\n- ", 1)[0]
+    claim = " ".join((start + text.split(start, 1)[1].split(end, 1)[0]).split())
+    assert "whole retry sequence" in claim
+    assert "accepted job" in claim
+    assert "work not yet submitted instead follows" in claim
+    target = (
+        "https://github.com/machinera-labs/machinera-python/blob/main/"
+        "api.md#staged-upload-recovery-and-expiry"
+    )
+    assert f"[staged upload recovery and expiry]({target})" in claim
+
+
 def test_grouped_numbers_in_docs_are_documented_defaults() -> None:
-    allowed = {*expected_defaults().values(), str(DEFAULT_INLINE_CAP_BYTES)}
+    allowed = {
+        *expected_defaults().values(),
+        str(DEFAULT_INLINE_CAP_BYTES),
+        str(DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S),
+        str(DEFAULT_RESULT_RETENTION_S),
+    }
     for text in (README, REFERENCE):
         for number in re.findall(r"\b\d{1,3}(?:,\d{3})+\b", text):
             assert number.replace(",", "") in allowed, number
@@ -74,15 +157,11 @@ def failure_table(text: str) -> str:
     return table(text, "| # | Exception | Action |")
 
 
-def test_readme_failure_table_is_identical_to_reference() -> None:
-    def intro(text: str) -> str:
-        start = text.index("Failure handling\n") + len("Failure handling\n")
-        return text[start : text.index("| # | Exception | Action |", start)]
-
-    assert intro(README) == intro(REFERENCE)
-    assert intro(README).count("\n- ") == 3
-    assert failure_table(README) == failure_table(REFERENCE)
-    assert failure_table(README).count("\n| ") == 8
+def test_readme_links_to_authoritative_failure_handling() -> None:
+    section = README.split("## Failure handling\n", 1)[1].split("\n## ", 1)[0]
+    assert "api.md#failure-handling)" in section
+    assert "| # | Exception | Action |" not in README
+    assert failure_table(REFERENCE).count("\n| ") == 8
 
 
 def test_lost_submission_row_precedes_the_rows_it_overrides() -> None:
@@ -354,7 +433,7 @@ def test_unsent_unkeyed_job_submission_is_repeated_as_made() -> None:
         assert error.is_transient is True
         assert support.submit(sdk, "file", None).text == "hi"
     assert len(posts) == ATTEMPTS + 1
-    row = failure_table(README).splitlines()[2:][4]
+    row = failure_table(REFERENCE).splitlines()[2:][4]
     assert row.startswith("| 5 |") and "when `is_transient` is `True`" in row
     assert "is `True` exactly where" not in row
 
@@ -670,6 +749,7 @@ def test_public_docs_never_link_to_source() -> None:
         assert not re.search(r"\]\([^)]*\bsrc/", text), name
     for text in (README, REFERENCE, (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")):
         assert "src/" not in text
+        assert "_contract" not in text
         assert not re.search(r"`_[A-Za-z]\w*`", text)
 
 
@@ -763,14 +843,38 @@ def test_readme_recipes_share_the_keyed_recovery_exception(
 
 
 def test_readme_deadline_headline_links_exceptions_and_polling_rule() -> None:
-    section = README.split("## Deadlines and retries\n", 1)[1].split("\n\n| Setting", 1)[0]
+    section = README.split("## Deadlines and retries\n", 1)[1].split("\n## ", 1)[0]
     assert "ends only" not in section
-    assert "subject to [async local I/O]" in section
-    assert "and [recipe hashing](#evaluation-harnesses) caveats" in section
+    assert "api.md#deadline-exceptions)" in section
     assert "canonical [polling and recovery rule]" in section
     assert "api.md#retrypolicy" in section
-    assert "api.md#asyncmachinera" in section
-    assert "caller-keyed recovery exception" in failure_table(README)
+    interrupt = README.split("- **Ctrl-C:**", 1)[1].split("\n- **", 1)[0]
+    assert "api.md#deadline-exceptions)" in interrupt
+    assert "caller-keyed recovery exception" in failure_table(REFERENCE)
+
+
+def test_reference_groups_deadline_exceptions() -> None:
+    section = REFERENCE.split("#### Deadline exceptions\n", 1)[1].split("\n#### ", 1)[0]
+    assert "**Async local I/O:**" in section
+    assert "**Blocking local work:**" in section
+    assert "**Blocking deferred cleanup:**" in section
+    assert "`Machinera.cancel()`" in section
+    assert "[cancellation latency contract](#cancel)" in section
+    assert "**Recipe pre-call hashing:**" in section
+    cancellation = REFERENCE.split("#### `cancel`\n", 1)[1].split("\n#### ", 1)[0]
+    assert "[deadline exceptions](#deadline-exceptions)" in cancellation
+    assert "**Deadline and cancellation exceptions:**" not in REFERENCE
+
+
+def test_api_reference_section_links_resolve() -> None:
+    headings = re.findall(r"^#{1,6} (.+)$", REFERENCE, re.MULTILINE)
+    anchors = {re.sub(r"[^\w -]", "", heading).lower().replace(" ", "-") for heading in headings}
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    for text in (README, REFERENCE, changelog):
+        for anchor in re.findall(r"\]\([^)]*api\.md#([^)]*)\)", text):
+            assert anchor in anchors, anchor
+    for anchor in re.findall(r"\]\(#([^)]*)\)", REFERENCE):
+        assert anchor in anchors, anchor
 
 
 def test_changelog_qualifies_interruption_retry_behavior() -> None:
@@ -831,10 +935,158 @@ def test_recovery_and_timeout_qualifications_are_linked() -> None:
     assert "[`is_transient`](#machineraerror)" in conflict
     assert "[Failure handling](#failure-handling)" in conflict
     assert "permanent" not in conflict
-    assert "Calls remain bounded, subject to [async local I/O](#asyncmachinera)" in flat
-    assert "and [recipe hashing]" in flat
-    assert "runs or bills it twice, subject to [replay retention]" in flat
+    assert (
+        "Calls remain bounded, subject to the [deadline exceptions](#deadline-exceptions)" in flat
+    )
+    assert "for duplicate-charge and replay-retention guarantees" in flat
     assert "caller-keyed call with no `job_id` and `is_transient=False`" in flat
     assert "row 7 is an `InternalServerError` or `APIResponseValidationError` in `phase`" in flat
     assert '`"job_submit"` or `"submit"`, excluding HTTP 4xx' in flat
     assert "`APIConnectionError` with `retryable=False` does not qualify" in flat
+
+
+def test_cancellation_contract_interval_matches_the_sdk() -> None:
+    contract = REFERENCE.split("#### `cancel`\n", 1)[1].split("\n#### ", 1)[0]
+    intervals = re.findall(r"\*\*(\d+(?:\.\d+)?) ms\*\*", contract)
+    assert len(intervals) == 1, "The cancellation contract must state its interval once"
+    assert all(float(value) / 1000 == pytest.approx(_CANCEL_INTERVAL) for value in intervals)
+
+
+@pytest.mark.parametrize("document", ["README.md", "CHANGELOG.md"])
+def test_cancellation_summaries_link_to_contract_without_copied_durations(document: str) -> None:
+    text = (ROOT / document).read_text(encoding="utf-8")
+    if document == "README.md":
+        summary = text.split("- **Ctrl-C:**", 1)[1].split("\n- ", 1)[0]
+        target = "https://github.com/machinera-labs/machinera-python/blob/main/api.md#cancel"
+    else:
+        summary = text.split("- `Machinera.cancel()`", 1)[1].split("\n\n", 1)[0]
+        target = "api.md#cancel"
+    assert f"[cancellation contract]({target})" in summary
+    assert not re.search(
+        r"\b\d+(?:[.,]\d+)*[\s*-]*(?:milliseconds?|seconds?|ms|s)\b",
+        summary,
+        re.IGNORECASE,
+    )
+
+
+def test_readme_import_time_client_owns_interrupts() -> None:
+    import signal
+
+    namespace: dict[str, Any] = {"PermanentError": PermanentError}
+    exec(code_block(README, "class MachineraProvider"), namespace)
+    clients = []
+
+    def construct(**options: Any) -> machinera.Machinera:
+        assert options == {"cancel_on_interrupt": True}
+        client = machinera.Machinera(api_key="key", **options)
+        clients.append(client)
+        return client
+
+    namespace["Machinera"] = construct
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        exec(code_block(README, "CLIENT = Machinera(cancel_on_interrupt=True)"), namespace)
+        provider = namespace["provider"]
+        assert provider.client is clients[0]
+        # No harness hook calls cancel: the provider owns SIGINT at import time.
+        with pytest.raises(KeyboardInterrupt) as caught:
+            signal.raise_signal(signal.SIGINT)
+        assert type(caught.value) is KeyboardInterrupt
+        with pytest.raises(KeyboardInterrupt) as worker_error:
+            provider.transcribe(WAV)
+        assert type(worker_error.value) is KeyboardInterrupt
+        assert isinstance(worker_error.value.__cause__, machinera.TranscriptionInterrupted)
+    finally:
+        for client in clients:
+            client.close()
+        signal.signal(signal.SIGINT, previous)
+
+
+@pytest.mark.parametrize(
+    ("error_type", "status", "job_id", "phase", "retryable", "caller_key", "row", "repeat"),
+    [
+        (machinera.TranscriptionInterrupted, None, "job-1", "poll", False, True, 1, False),
+        (machinera.TerminalJobError, 200, "job-1", "poll", True, True, 2, False),
+        # Even a transient failed job needs a new submission, not same-job recovery.
+        (machinera.TerminalJobError, 200, "job-1", "poll", True, False, 2, False),
+        (machinera.NotFoundError, 404, "job-1", "poll", False, True, 7, False),
+        (machinera.NotFoundError, 404, "job-1", "poll", False, None, 7, False),
+        (machinera.NotFoundError, 404, None, "job_submit", False, True, 7, False),
+        (machinera.DeadlineExceededError, None, "job-1", "poll", None, True, 3, True),
+        (machinera.DeadlineExceededError, None, None, "job_submit", None, True, 5, True),
+        (machinera.InternalServerError, 500, None, "submit", False, True, 7, True),
+        (machinera.InternalServerError, 500, "job-1", "poll", False, True, 3, True),
+        (machinera.RateLimitError, 429, None, "upload_init", True, True, 6, True),
+        (machinera.AmbiguousSubmissionError, None, None, "sync_submit", False, False, 4, False),
+    ],
+)
+def test_readme_worth_retrying_matches_ordered_failure_rows(
+    error_type: type[machinera.APIError],
+    status: int | None,
+    job_id: str | None,
+    phase: str,
+    retryable: bool | None,
+    caller_key: bool | None,
+    row: int,
+    repeat: bool,
+) -> None:
+    error = error_type(
+        "failed", status_code=status, job_id=job_id, phase=phase, retryable=retryable
+    )
+    error._caller_key = caller_key
+    # Bind the cases to the reference's ordered conditions and actions, including
+    # the row 3 exclusion and row 7's narrowly scoped keyed recovery exception.
+    rows = [line.split(" | ") for line in failure_table(REFERENCE).splitlines()[2:]]
+    assert [int(cells[0].removeprefix("| ")) for cells in rows] == list(range(1, 8))
+    conditions = {
+        1: "`TranscriptionInterrupted`",
+        2: "`TerminalJobError`, including `TerminalIntegrityError`",
+        3: "Any other `APIError` with `job_id` set, excluding non-transient 4xx errors (row 7)",
+        4: "`AmbiguousSubmissionError`",
+        5: "`RecoverableJobError` (`DeadlineExceededError`) without `job_id`",
+        6: "Any other error with `is_transient` `True`",
+        7: "Anything else (`is_transient` `False`)",
+    }
+    actions = {
+        1: "Stop;",
+        2: "never `resume` it",
+        3: "Call `resume(job_id, response_format=...)`",
+        4: "treat it as failed for this input",
+        5: "repeat the call as made",
+        6: "Repeat the identical call",
+        7: "Permanent for this input, including a non-transient 4xx with `job_id` set",
+    }
+    for number, cells in enumerate(rows, 1):
+        assert cells[1].startswith(conditions[number])
+        assert actions[number] in cells[2]
+    if row == 7 and repeat:
+        assert "[caller-keyed recovery exception]" in rows[row - 1][2]
+    if row == 2 and caller_key is False:
+        assert error.is_transient  # row 2 must win over row 6
+    if error_type is machinera.DeadlineExceededError:
+        assert error.is_transient  # rows 3/5 win over row 6
+
+    namespace: dict[str, Any] = {}
+    exec(code_block(README, "def worth_retrying"), namespace)
+    assert namespace["worth_retrying"](error) is repeat, f"Failure handling row {row}"
+
+
+def test_readme_provider_stops_on_initial_poll_not_found() -> None:
+    requests: list[httpx.Request] = []
+    clock = Clock()
+    provider = readme_provider(
+        job_service(
+            requests,
+            lambda n: accepted(),
+            lambda n: httpx.Response(404, json={"error": {"code": "job_not_found"}}),
+        ),
+        clock,
+    )
+    harness = Harness(provider, clock)
+    with pytest.raises(PermanentError) as caught:
+        harness.run()
+    error = caught.value.__cause__
+    assert isinstance(error, machinera.NotFoundError)
+    assert error.job_id == "job-1" and error.phase == "poll" and not error.is_transient
+    assert len(harness.attempts) == 1
+    assert [request.method for request in requests] == ["POST", "GET"]

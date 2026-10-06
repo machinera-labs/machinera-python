@@ -8,9 +8,12 @@ is the authority for every behavior summarized here.
 ## Install and pin
 
 ```sh
-pip install "machinera==0.1.3"
+pip install "machinera==0.1.4"
 export MACHINERA_API_KEY="your-api-key"
 ```
+
+APIs listed under [CHANGELOG “Unreleased”](https://github.com/machinera-labs/machinera-python/blob/main/CHANGELOG.md#unreleased)
+require the next release and are not available in the pin above.
 
 - Python 3.10 through 3.14. No audio decoder or conversion tools are needed.
 - Pin an exact version where installs must be reproducible. During `0.x`, minor
@@ -104,25 +107,13 @@ only the SDK's choice, never the service's limits.
 
 ## Failure handling
 
-- The SDK already retries what is safe to retry; see [Deadlines and
-  retries](https://github.com/machinera-labs/machinera-python/blob/main/README.md#deadlines-and-retries).
-- Use the first matching row. Rows 1–5 are for code that owns recovery.
-- Under an outer retry, `is_transient` means repeating the identical call, as made, is safe and may
-  succeed; remembered `job_id` or key context also matters (rows 3 and 5). Pass `idempotency_key` on
-  every call so a retry replays an accepted job instead of submitting a new one, and re-raise
-  interrupts as plain `KeyboardInterrupt`, as the [harness
-  recipe](https://github.com/machinera-labs/machinera-python/blob/main/README.md#evaluation-harnesses)
-  does.
-
-| # | Exception | Action |
-| --- | --- | --- |
-| 1 | `TranscriptionInterrupted` | Stop; `is_transient` is always `False`. Save `operation_key` and `job_id`, and continue later with the row that matches them. If `ambiguous` is `True`, follow row 4. |
-| 2 | `TerminalJobError`, including `TerminalIntegrityError` | The job failed; never `resume` it. Repeating the call with the same key replays this failed job and raises the same error. Record `code`. If `retryable` is `True`, a submission under a new key may succeed, as a new job and a new charge; `is_transient` is then `True` for an unkeyed call, whose repeat is that new submission, and `False` for a keyed call or `resume`. |
-| 3 | Any other `APIError` with `job_id` set | The job was accepted. Call `resume(job_id, response_format=...)` with the original format after a pause; it only polls and never charges again. A call with `idempotency_key` may instead be repeated as made when `is_transient` is `True`, which replays this job. If `resume` fails, a `TerminalJobError` follows row 2 and a non-transient 4xx such as `NotFoundError` is final for this job (row 7); any other failure, such as a 5xx, a malformed body, or a connection error, leaves the job unaffected, so `resume` again after a pause, within your own retry limit, whatever `is_transient` says. For a call without `idempotency_key`, `is_transient` is `False` here, because repeating that call would submit and bill a second job while this one may still run. |
-| 4 | `AmbiguousSubmissionError` | An unkeyed synchronous request may have run (default `sync_replay="never"` only), and no SDK call can tell whether it did. Repeating it, with or without a key, may bill it again, so treat it as failed for this input unless a second charge is acceptable. A key on every call avoids this case. |
-| 5 | `RecoverableJobError` (`DeadlineExceededError`) without `job_id`, or a lost job submission: an `APIConnectionError` or status error with `retryable` `True`, without `job_id`, in `phase` `"job_submit"` or `"submit"` | By `phase`: `"prepare"` or `"concurrency_wait"`: nothing was sent; repeat the call as made. `"sync_submit"`: row 4 under the default, or repeat the call under `sync_replay="always"`. Any other phase: when `is_transient` is `True` (see the [`is_transient` table](https://github.com/machinera-labs/machinera-python/blob/main/api.md#machineraerror)), repeat the call as made; otherwise repeat the identical call with `idempotency_key=error.operation_key`, which replays the job if it was accepted, because a lost submission's job may have been accepted and repeating the call as made could submit and bill a second one. |
-| 6 | Any other error with `is_transient` `True` | Repeat the identical call, with the same key, after a pause. The SDK has already retried it. |
-| 7 | Anything else (`is_transient` `False`) | Permanent for this input, except for the [caller-keyed recovery exception](https://github.com/machinera-labs/machinera-python/blob/main/api.md#machineraerror). This covers `AuthenticationError`, `PermissionDeniedError`, `BadRequestError`, `UnprocessableEntityError`, `PayloadTooLargeError`, `NotFoundError`, `ConflictError`, `UploadError` and `IntegrityError`, a status error that `is_transient` does not make transient (a bare 500 under the default `sync_replay="never"`, for example), a 5xx on the synchronous route under that default (it may have run; see row 4), and `APIConnectionError` from a closed client, from local file I/O such as a missing path, or with `retryable` `False`. Record the class name, `code`, and `request_id`. A new key is a new submission and a new charge. |
+The SDK already retries what is safe to retry. For recovery, use the first matching
+row of the API reference's [Failure handling table](https://github.com/machinera-labs/machinera-python/blob/main/api.md#failure-handling),
+which covers interrupts, failed or accepted jobs, ambiguous submissions, and other
+errors. Under an outer retry, `is_transient` means repeating the identical call, as
+made, is safe and may succeed; remembered `job_id` or key context also matters.
+Pass `idempotency_key` on every call and re-raise interrupts as plain
+`KeyboardInterrupt`, as the [harness recipe](#evaluation-harnesses) does.
 
 A status error's `retryable` is the service's flag when it sends one, otherwise the
 SDK's code table, otherwise `True` only for HTTP 429, 502, 503, and 504. Whether an
@@ -133,9 +124,9 @@ response, including a failed job, always has `retryable` `True` or `False`, neve
 a failed job whose code the SDK does not know, sent without the service's flag, has
 `False`.
 
-With your own `idempotency_key`, repeating the identical call is always safe: the
-service answers a repeated key with the original job, running or finished, and never
-runs or bills it twice. `is_transient` then says only whether the repeat may succeed.
+With your own `idempotency_key`, repeating the identical call never runs or bills it
+twice; returning the original job/result depends on replay retention (see
+[Recovery after a restart](#recovery-after-a-restart)). `is_transient` then says only whether the repeat may succeed.
 A keyed job submission that was sent but ended without a `job_id` in a non-transient
 5xx or `APIResponseValidationError` may have been accepted, so repeating it with the
 same key, within your own retry limit, may still return the job.
@@ -152,9 +143,10 @@ For a failed job's codes, retryability, and meanings, see the
 
 Most harnesses call the provider from several threads and retry a failed sample unless
 it raises a permanent error. The provider below applies the
-[failure table](https://github.com/machinera-labs/machinera-python/blob/main/README.md#failure-handling) for such a harness, for files of any size: it keys
-every call, so a harness retry never submits the sample twice, and it resumes a job it
-has seen instead of submitting again (row 3).
+[failure table](https://github.com/machinera-labs/machinera-python/blob/main/api.md#failure-handling) for files of any size: within a run, retries of
+identical input (same bytes, suffix and options; see **Keys** below) never run or bill
+a job twice, and known jobs are resumed (row 3). Recovery may repeat HTTP submissions
+under the same key; see [`resume`](https://github.com/machinera-labs/machinera-python/blob/main/api.md#resume).
 
 ```python
 import hashlib
@@ -180,7 +172,7 @@ BUDGET = 300  # seconds per attempt, counted from before hashing; hashing is not
 
 class MachineraProvider:
     def __init__(self) -> None:
-        self.client = Machinera()
+        self.client = CLIENT
         self.digests: dict[tuple[str, int, int], str] = {}  # (path, size, mtime) -> hash
         self.hashing: dict[str, threading.Lock] = {}  # one thread hashes a path at a time
         self.jobs: dict[str, str] = {}  # key -> a job_id an earlier error carried
@@ -246,10 +238,12 @@ class MachineraProvider:
 def worth_retrying(exc: MachineraError) -> bool:
     """Transient, or a keyed request that may still succeed; never a failed job or a non-transient 4xx."""
     status = getattr(exc, "status_code", None) or 0
+    if isinstance(exc, (TranscriptionInterrupted, TerminalJobError)):
+        return False  # rows 1 and 2 take precedence even if a failed job is transient
     if exc.is_transient:
         return True
-    if isinstance(exc, TerminalJobError) or 400 <= status < 500:
-        return False
+    if 400 <= status < 500:
+        return False  # row 7, even with a job_id from the initial call
     if getattr(exc, "job_id", None) is not None:
         return True  # a status read failed; the job is unaffected (row 3)
     submitting = getattr(exc, "phase", None) in ("job_submit", "submit")
@@ -257,23 +251,70 @@ def worth_retrying(exc: MachineraError) -> bool:
 ```
 
 `PermanentError` is your harness's do-not-retry exception, and `audio` is a path or the
-file's bytes. A path needs a supported suffix. One client per provider object, shared by
-the harness's threads, is fine.
+file's bytes. This recipe requires a supported path suffix because its key includes
+the suffix and it sends an explicit filename with that suffix. The SDK itself also
+accepts other inputs, including paths identified by container inspection; see
+[`transcribe_file`](https://github.com/machinera-labs/machinera-python/blob/main/api.md#transcribe_file).
+Every provider object and the harness's threads share one module-level `CLIENT`.
+Calling `cancel()` affects every active and future operation on that shared instance;
+see the [cancellation contract](https://github.com/machinera-labs/machinera-python/blob/main/api.md#cancel).
+Construct the client at module import on the main thread, before the harness starts
+its worker threads:
+
+```python
+CLIENT = Machinera(cancel_on_interrupt=True)
+provider = MachineraProvider()
+```
+
+The provider now owns SIGINT cancellation without requiring a harness interrupt
+hook; see the [cancellation contract](https://github.com/machinera-labs/machinera-python/blob/main/api.md#cancel).
+When you also own the executor, its cleanup can look like this:
+
+```python
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def run_samples(samples: list[str]) -> list[str]:
+    executor = ThreadPoolExecutor(8)
+    try:
+        futures = [executor.submit(provider.transcribe, sample) for sample in samples]
+        return [future.result() for future in as_completed(futures)]
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+        provider.client.close()  # interrupted SDK calls unwind promptly
+```
 
 - **Billed once:** the [keyed-call guarantee](https://github.com/machinera-labs/machinera-python/blob/main/api.md#machineraerror)
   means a harness retry and two threads given the same path (the same bytes and suffix;
   see **Keys** below) under the same `RUN` and options both reach one job. The recipe's
-  `worth_retrying` follows [Failure handling](#failure-handling), including its
+  `worth_retrying` follows [Failure handling](https://github.com/machinera-labs/machinera-python/blob/main/api.md#failure-handling), including its
   caller-keyed recovery exception. A `job_id` is remembered unless the job failed,
   including before an interruption is re-raised; later attempts `resume` it per row 3.
-  The harness's retry limit bounds recovery. Errors that `worth_retrying` rejects
+  The harness's retry limit bounds recovery. The
+  [retention minimums](https://github.com/machinera-labs/machinera-python/blob/main/api.md#retention-defaults)
+  are guaranteed: a harness whose whole retry sequence (attempts × budget + backoff)
+  finishes inside the replay-window minimum can recover an accepted job by key;
+  work not yet submitted instead follows
+  [staged upload recovery and expiry](https://github.com/machinera-labs/machinera-python/blob/main/api.md#staged-upload-recovery-and-expiry).
+  Include any time beyond the budget caused by pre-call hashing or the documented
+  deadline exceptions.
+  Errors that `worth_retrying` rejects
   become `PermanentError`; see rows 2 and 7. Whether a failed job itself was charged
   is decided by the service; the SDK cannot tell.
-- **Ctrl-C:** `TranscriptionInterrupted` is a `KeyboardInterrupt` but also an
-  `Exception`, so a harness that retries every `Exception` would retry it. Re-raising a
-  plain `KeyboardInterrupt` stops the run. Python delivers Ctrl-C only to the main
-  thread: a call running in another thread continues until it ends or reaches its
-  deadline.
+- **Ctrl-C:** the import-time client uses `cancel_on_interrupt=True` to call
+  `cancel()` before chaining to the previous SIGINT handler (normally a plain
+  `KeyboardInterrupt` in the main thread). No harness cancellation hook is needed.
+  This interrupts calls in running threads with `TranscriptionInterrupted`,
+  preserving known job IDs. The provider converts that error to plain
+  `KeyboardInterrupt` so a harness's `except Exception` does not retry it.
+  For the latency bound, including scheduling and local-work qualifications, see the
+  [cancellation contract](https://github.com/machinera-labs/machinera-python/blob/main/api.md#cancel).
+  Pending futures are cancelled; running SDK calls unwind. The interpreter still
+  joins executor threads at exit; see the
+  [deadline exceptions](https://github.com/machinera-labs/machinera-python/blob/main/api.md#deadline-exceptions)
+  for work that can delay exit. Cancellation is permanent for this client; use a
+  new client to resume. Close this client on the main thread to restore the previous
+  signal handler; construct a new client for another run.
 - **One budget per attempt:** the attempt's clock starts before hashing, so the SDK call
   and any `resume` get only what hashing left of `BUDGET`, as their `deadline`. The
   SDK's `deadline` covers its own preparation, waiting for a concurrency slot, the
@@ -288,9 +329,12 @@ the harness's threads, is fine.
   The pause between attempts is the harness's own.
 - **Long jobs:** a job outlives the harness. If the harness gives up first (for example
   after 10 attempts of 300 seconds), the job keeps running and is billed; rerun with
-  the same `RUN` to collect it, or raise `BUDGET` for long files, or for large files on
+  the same `RUN` to collect it while the [replay binding and result retention](https://github.com/machinera-labs/machinera-python/blob/main/api.md#retention-defaults) hold,
+  or raise `BUDGET` for long files, or for large files on
   a slow connection, whose upload restarts on every attempt, as does the SDK's own
-  hashing pass over a staged file, inside the SDK's `deadline`.
+  hashing pass over a staged file, inside the SDK's `deadline`. Size these attempts
+  and pauses using the [staged upload recovery and expiry contract](https://github.com/machinera-labs/machinera-python/blob/main/api.md#staged-upload-recovery-and-expiry),
+  which supplies no universal minimum upload window.
 - **Latency:** each sample's time includes job submission, waiting to start, and polling every
   [`RetryPolicy.poll_interval`](https://github.com/machinera-labs/machinera-python/blob/main/api.md#retrypolicy). `inference_seconds` on the result,
   when the service returns it, is the service's own processing time. A key from an
@@ -300,15 +344,10 @@ the harness's threads, is fine.
 - **Keys:** paths with the same run, model, language, format, suffix, and bytes share a
   key, whatever the rest of their names, and so do identical raw bytes, so a later or
   concurrent sample gets the earlier one's job and result instead of a second charge.
-  A submission repeating a running job's key returns that job, and the SDK polls it. A
-  path is sent as `upload.<suffix>`; the suffix stays in the key because it sets the
-  media type sent with the file, while bytes are named from their content. So every
-  submission under a key is the identical request, and the same bytes given as
-  `clip.m4a`, `clip.mp4`, and raw bytes are three keys and three jobs. The service keeps
-  a key's job for replay for a limited period (see
-  [Recovery after a restart](https://github.com/machinera-labs/machinera-python/blob/main/README.md#recovery-after-a-restart)); a retry after that fails with
-  `ConflictError`, code `idempotency_replay_unavailable`, which the recipe makes
-  permanent.
+  Repeating a running job's key returns that job for polling. Paths are sent as `upload.<suffix>`;
+  the suffix sets the media type and stays in the key. Raw bytes are named from their content.
+  Thus each key identifies an identical request: `clip.m4a`, `clip.mp4`, and raw bytes yield
+  three keys/jobs. Replay expiry is permanent; see [Recovery after a restart](#recovery-after-a-restart).
 - **Raw samples:** bytes must be a whole file in a supported format. Headerless PCM has
   no signature the SDK can identify, so it raises `ValueError`, and there is no
   sample-rate parameter. Wrap it in WAV with the standard library first:
@@ -359,7 +398,7 @@ no I/O, and connections are shared process-wide), or left unclosed for the life 
 process. `max_concurrency` limits only its own client. A closed client raises
 `APIConnectionError` with `is_transient` `False` on every later call, so never close a
 client you keep for reuse. A recovery loop that owns retries follows the same
-[Failure handling](#failure-handling) rules:
+[Failure handling](https://github.com/machinera-labs/machinera-python/blob/main/api.md#failure-handling) rules:
 
 ```python
 import hashlib
@@ -431,12 +470,14 @@ storage and then submitted as a job, automatically. The service sets the upload 
 limit, the upload expiry window, and the maximum audio duration (code
 `audio_duration_exceeded`); see the [public limits](https://api.machinera.com/docs/limits).
 
-- Do not change the file during the call or its recovery; a change raises
-  `IntegrityError`.
+- Keeping the file immutable across attempts is the caller's obligation. Changes
+  detected during SDK preparation or streaming raise `IntegrityError`; see
+  [`transcribe_file`](https://github.com/machinera-labs/machinera-python/blob/main/api.md#transcribe_file).
 - Set `deadline` for the whole job, including waiting to start. A deadline only stops waiting:
   the job keeps running and `resume(error.job_id)` picks it up.
-- `upload_expired` (`UploadError`, HTTP 410): the upload window passed and the key can no
-  longer be used.
+- Before submission, `upload_expired` (`UploadError`, HTTP 410) ends recovery under
+  that upload key; see [staged upload recovery and expiry](https://github.com/machinera-labs/machinera-python/blob/main/api.md#staged-upload-recovery-and-expiry)
+  for the separate upload deadline and how to size retries.
 - `upload_already_bound` or `idempotency_payload_mismatch`: the key was reused with
   different input or options; fix the key derivation.
 
@@ -483,13 +524,20 @@ with Machinera() as client:
   replays a staged submission and defaults to `"json"`. Pass the original format to
   either.
 - A job that failed (`TerminalJobError`) stays failed: the same key replays the failure.
-- The service keeps results and replays for a limited time, and recovery does not
-  extend it; the periods are in the API's
-  [result and idempotency retention](https://api.machinera.com/docs/errors#retention)
-  section. A key replays its job while it is retained. A job still running when its
-  key's period ends can no longer be replayed by key, so keep its `job_id` and use
-  `resume(job_id)`. After that, recovery fails with a permanent error such as `ConflictError`,
-  code `idempotency_replay_unavailable`; a new key is a new submission and a new charge.
+- Recovery is limited for accepted jobs by the public API's
+  [guaranteed retention minimums](https://github.com/machinera-labs/machinera-python/blob/main/api.md#retention-defaults):
+  the SDK's snapshot of these minimums is
+  `machinera.DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S` and `machinera.DEFAULT_RESULT_RETENTION_S`
+  (in seconds). Availability is listed in the [CHANGELOG entry](https://github.com/machinera-labs/machinera-python/blob/main/CHANGELOG.md)
+  that adds these constants.
+  A finished job and its binding are kept at least the longer of the two.
+  For accepted jobs, size retries and pauses against the cited minimums so that the
+  whole retry sequence finishes inside the guaranteed replay window; work not yet
+  submitted instead follows [staged upload recovery and expiry](https://github.com/machinera-labs/machinera-python/blob/main/api.md#staged-upload-recovery-and-expiry).
+  Recovery does not extend retention.
+  After expiry a replay fails with `ConflictError`, code `idempotency_replay_unavailable`.
+  Keep `job_id` to `resume(job_id)` if a running job's binding expires;
+  a new key submits and charges anew.
 - The SDK never cancels a server job and keeps no journal on disk.
 
 Complete programs: [blocking](https://github.com/machinera-labs/machinera-python/blob/main/examples/submit_and_resume.py),
@@ -499,30 +547,17 @@ Complete programs: [blocking](https://github.com/machinera-labs/machinera-python
 ## Deadlines and retries
 
 Every call is bounded by a total deadline that covers preparation, waiting for a
-concurrency slot, requests, retry pauses, and polling, subject to [async local I/O](https://github.com/machinera-labs/machinera-python/blob/main/api.md#asyncmachinera)
-and [recipe hashing](#evaluation-harnesses) caveats. Pass `deadline=seconds` to
-`transcribe_file`, `transcribe_url`, or `resume` to change it for one call. See the
-canonical [polling and recovery rule](https://github.com/machinera-labs/machinera-python/blob/main/api.md#retrypolicy).
+concurrency slot, requests, retry pauses, and polling, subject to the
+[deadline exceptions](https://github.com/machinera-labs/machinera-python/blob/main/api.md#deadline-exceptions).
+Pass `deadline=seconds` to `transcribe_file`, `transcribe_url`, or `resume` to change
+it for one call. See the canonical [polling and recovery rule](https://github.com/machinera-labs/machinera-python/blob/main/api.md#retrypolicy).
 
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `TimeoutPolicy.connect` | `5` | Connect inactivity, seconds. |
-| `TimeoutPolicy.write` | `600` | Write inactivity, seconds. |
-| `TimeoutPolicy.read` | `600` | Read inactivity, seconds. |
-| `TimeoutPolicy.pool` | `600` | Seconds to wait for a connection. |
-| `TimeoutPolicy.poll_request` | `30` | Seconds per status read. |
-| `TimeoutPolicy.deadline` | `3600` | Total seconds per call. |
-| `RetryPolicy.max_attempts` | `3` | Attempts per step, including the first. |
-| `RetryPolicy.initial_delay` | `0.5` | First retry pause, seconds. |
-| `RetryPolicy.max_delay` | `8` | Longest computed pause, seconds. |
-| `RetryPolicy.poll_interval` | `1` | Seconds between status reads. |
-| `RetryPolicy.max_polls` | `None` | Optional cap on status reads. |
-| `Limits.sync_inline_body_bytes` | `26,214,400` | Largest synchronous request. |
-| `Limits.job_inline_body_bytes` | `52,428,800` | Largest inline durable job. |
-| `Limits.descriptor_bytes` | `65,536` | Largest URL or job descriptor. |
+`TimeoutPolicy`, `RetryPolicy`, and `Limits` configure timeouts, retries, polling,
+and request sizes. See the API reference's [Defaults table](https://github.com/machinera-labs/machinera-python/blob/main/api.md#defaults)
+for every setting, its default value, and its meaning.
 
 The SDK retries network failures and the status errors that the rule under
-[Failure handling](https://github.com/machinera-labs/machinera-python/blob/main/README.md#failure-handling) makes transient, only when resending is safe or
+[Failure handling](https://github.com/machinera-labs/machinera-python/blob/main/api.md#failure-handling) makes transient, only when resending is safe or
 `sync_replay="always"` allows it. Pauses are
 `min(initial_delay * 2**retry, max_delay)` times a random factor in `[0.75, 1]`, and a
 `Retry-After` header sets a minimum. A pause that cannot finish before the deadline

@@ -1,6 +1,10 @@
 from ._async_client import AsyncMachinera
 from ._client import Machinera
-from ._contract import SUPPORTED_MEDIA_SUFFIXES
+from ._contract import (
+    DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S,
+    DEFAULT_RESULT_RETENTION_S,
+    SUPPORTED_MEDIA_SUFFIXES,
+)
 from ._exceptions import (
     AmbiguousSubmissionError,
     APIConnectionError,
@@ -41,6 +45,8 @@ from ._uploads import UploadPhase
 from ._version import __version__
 
 __all__ = [
+    "DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S",
+    "DEFAULT_RESULT_RETENTION_S",
     "SUPPORTED_MEDIA_SUFFIXES",
     "APIError",
     "APIResponseValidationError",

@@ -179,8 +179,10 @@ class _Call:
     # True once a job submission was sent and its response lost: the service may have
     # accepted a job whose ID the SDK never saw.
     submission_lost: bool = False
+    interrupted: Callable[[], None] = lambda: None
 
     def remaining(self) -> float:
+        self.interrupted()
         remaining = self.end - self.clock()
         if remaining <= 0:
             raise DeadlineExceededError("Operation deadline exceeded")
@@ -501,6 +503,7 @@ class Core:
             def check(
                 request_end: float = request_end, expired: Callable[[], BaseException] = expired
             ) -> None:
+                call.interrupted()
                 if self._clock() >= call.end:
                     raise expired()
                 if method == "GET" and self._clock() >= request_end:

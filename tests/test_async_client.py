@@ -324,6 +324,14 @@ async def test_signatures_match_and_methods_are_coroutines() -> None:
     for name in ("__init__", "transcribe_file", "transcribe_url", "get_job", "resume"):
         sync = inspect.signature(getattr(Machinera, name))
         asynchronous = inspect.signature(getattr(AsyncMachinera, name))
+        if name == "__init__":
+            option = sync.parameters["cancel_on_interrupt"]
+            assert option.default is False
+            assert option.kind is inspect.Parameter.KEYWORD_ONLY
+            assert "cancel_on_interrupt" not in asynchronous.parameters
+            sync = sync.replace(
+                parameters=[p for p in sync.parameters.values() if p.name != "cancel_on_interrupt"]
+            )
         assert list(sync.parameters) == list(asynchronous.parameters)
         if name != "__init__":
             assert sync == asynchronous

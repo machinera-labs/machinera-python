@@ -4,8 +4,7 @@ Import every documented symbol from `machinera`. The SDK has a blocking client
 (`Machinera`) and a native asyncio client (`AsyncMachinera`). Separately, a
 *durable job* is a server-side transcription job that can be resumed by ID;
 `transport="job"` and `Limits.job_inline_body_bytes` refer to durable jobs. This
-file is the authority; the README summarizes it, and its failure-handling table is
-identical to [Failure handling](#failure-handling).
+file is the authority; the README summarizes it.
 
 ## Clients
 
@@ -22,6 +21,7 @@ Machinera(
     retry_policy: RetryPolicy | None = None,
     limits: Limits | None = None,
     max_concurrency: int | None = None,
+    cancel_on_interrupt: bool = False,
     transport: Literal["auto", "job"] | httpx.BaseTransport = "auto",
     sync_replay: Literal["never", "always"] = "never",
     http_client: httpx.Client | None = None,
@@ -48,6 +48,7 @@ Omitted `timeout` and `max_retries` use the [defaults](#defaults).
 | `max_concurrency` | Positive integer limiting active operations on this client, or `None` for no client semaphore. Waits count toward the deadline. Other clients are not limited, so a client built per call gets no cross-client cap. |
 | `transport` | Two unrelated meanings share this parameter. The route mode: `"auto"` selects inline sync or a durable job by encoded size, falling back to a durable job when the synchronous route refuses the request before starting work (see `transcribe_file`); `"job"` always selects a durable job. An HTTP transport: a custom `httpx.BaseTransport` replaces the HTTP layer and fixes the route mode at `"auto"`; pass `idempotency_key` to force durable jobs with it. |
 | `sync_replay` | Exactly `"never"` (the default) or `"always"`; any other value raises `ValueError`. See [Synchronous replay](#synchronous-replay). |
+| `cancel_on_interrupt` | Blocking client only; default `False`. When `True`, install a chaining SIGINT handler; construct and close on the main thread. See [cancel](#cancel). |
 | `http_client` | Optional caller-owned `httpx.Client`; cannot be combined with a custom transport. Its pool settings and lifetime remain the caller's responsibility. |
 | `clock`, `sleeper` | Monotonic time and delay functions, injectable for tests. |
 | `wall_clock` | Wall time for HTTP-date `Retry-After` parsing. |
@@ -115,12 +116,46 @@ job fallback are unaffected.
 - `timeout=httpx.Timeout(...)` copies its four phase values, including disabled
   (`None`) phases, retaining the inherited poll-request and total deadline bounds.
 - `timeout=None` disables HTTP phase inactivity limits, retaining the inherited
-  poll-request and total deadline bounds. Calls remain bounded, subject to [async local I/O](#asyncmachinera) and [recipe hashing](https://github.com/machinera-labs/machinera-python/blob/main/README.md#evaluation-harnesses) caveats.
+  poll-request and total deadline bounds. Calls remain bounded, subject to the
+  [deadline exceptions](#deadline-exceptions).
 - `timeout=TimeoutPolicy(...)` replaces all phase and elapsed budgets.
 - `deadline=seconds`, where supported, overrides the resolved total call budget.
 
 At construction, scalar/httpx/`None` forms inherit poll/deadline settings from
 `TimeoutPolicy()`; on methods, they inherit those settings from the client.
+
+#### Deadline exceptions
+
+The total deadline includes SDK preparation, concurrency waits, HTTP requests,
+retry sleeps, and polling, with these exceptions; the blocking client's
+[cancellation latency contract](#cancel) is subject to the same local-work and
+deferred-cleanup qualifications:
+
+- **Async local I/O:** `AsyncMachinera` runs hashing, container inspection, opening,
+  reading, and releasing files via `asyncio.to_thread`. Deadline watchdogs cancel
+  awaited operations, but cleanup waits for any in-flight local file operation
+  before restoring the original offset or closing owned files. A stalled local
+  file operation can delay exception delivery without blocking the event loop.
+- **Blocking local work:** synchronous file open/close and local CPU work on the
+  calling thread, such as response decoding/validation, cannot be preempted by
+  the deadline or `Machinera.cancel()`. These can delay caller return and process
+  exit. Caller-provided clock/random callbacks must return promptly.
+- **Recipe pre-call hashing:** hashing in the README's [evaluation-harness
+  recipes](https://github.com/machinera-labs/machinera-python/blob/main/README.md#evaluation-harnesses)
+  runs before the SDK call and is not interrupted by its deadline or cancellation.
+  The provider subtracts hashing time from its attempt budget, but hashing can still
+  make an attempt exceed that budget and delay process exit.
+- **Blocking deferred cleanup:** SDK file preparation/hashing and reads run in
+  daemon threads. The caller stops waiting within its deadline or cancellation
+  bound, but an ongoing filesystem access cannot be forcibly stopped. Do not
+  touch its handle until `wait_for_file_release` succeeds. DNS/connect/TLS setup
+  before a usable socket is available, custom transports/hooks, and injected
+  sleepers that ignore interruption may likewise finish in a daemon thread;
+  their late results are discarded and no next SDK request is started. The bound
+  covers returning control to the caller, not completion of deferred cleanup.
+  A custom transport must expose trace network streams or a closable response
+  stream to abort its actual I/O; arbitrary transport code blocked before either
+  is available cannot be forcibly terminated.
 
 #### Lifecycle
 
@@ -129,12 +164,81 @@ At construction, scalar/httpx/`None` forms inherit poll/deadline settings from
 - `close() -> None`: wait for active calls and close only the HTTP clients the SDK
   created.
   Cleanup of a cancelled exchange can be deferred until its pending I/O finishes.
-  Subsequent operations raise `APIConnectionError`. Context exit does not wait for a
-  cancelled input read.
+  Subsequent operations raise `APIConnectionError` unless `cancel()` was called,
+  in which case they raise `TranscriptionInterrupted`. Context exit does not wait for a
+  cancelled input read. With `cancel_on_interrupt=True`, close on the main thread
+  to restore the previous SIGINT handler; closing elsewhere raises `ValueError`.
 - A client may be left unclosed: blocking connection pools close at process exit.
 - When a call is cancelled, the SDK closes the in-flight connection or response stream
   and makes no further requests. A custom transport that cannot be interrupted may
   finish in a background daemon thread, and its late result is discarded.
+
+#### `cancel`
+
+```python
+cancel() -> None
+```
+
+With `Machinera(cancel_on_interrupt=True)`, construct the client at module import
+on the main thread (or otherwise in the main thread). Construction elsewhere raises
+`ValueError` before installing a handler or creating HTTP clients. The installed
+SIGINT handler calls `self.cancel()` first, then delegates to the previously
+installed Python handler with the original signal number and frame. With Python's
+usual `signal.default_int_handler`, the harness receives a plain `KeyboardInterrupt`
+in its main thread, without needing its own cancellation hook. A custom handler
+retains its behavior; `SIG_IGN` remains ignored after local cancellation, and
+`SIG_DFL` retains process termination. Repeated signals and explicit `cancel()`
+are idempotent for SDK cancellation; each signal still chains to the prior handler.
+
+`close()` restores the previous handler after cleanup. It does not overwrite a
+handler installed later by other code. If nesting opted-in clients, close them in
+reverse construction order. The default `False` leaves SIGINT handling untouched.
+This option is only on `Machinera`; asyncio uses task cancellation.
+
+Permanently interrupt every active and subsequently started operation on this
+`Machinera` instance with `TranscriptionInterrupted`. This is an idempotent,
+thread-safe, non-waiting request: call it from any thread, including a Python
+signal handler in the main thread. It does not close the client; `close()` still
+performs graceful cleanup. Cancellation takes precedence over a concurrent
+operation failure or a closed-client error. Create a new client to do more work.
+Cancellation only affects work still waiting; a call whose result is already in
+hand returns it even if cancellation arrives before the operation context exits.
+
+`TranscriptionInterrupted` is both a `KeyboardInterrupt` and a `RecoverableJobError`
+(and therefore an `Exception`). It retains `job_id` when known, plus
+`operation_key`, `upload_id`, `phase`, and the usual recovery context. Save these
+before retry handling. Resume a known job on a new client, or replay a staged
+upload using the same key, identical file bytes and original options. An aborted
+PUT never advances to submission locally; a PUT or submission already received
+by the service can still complete. Conditional storage writes and the existing
+idempotency protocol make replay safe. For caller-owned handles, wait for
+`error.wait_for_file_release(...)` to return `True`, then seek back to the original
+offset before reuse. Alternatively, reopen the path or supply the original bytes.
+**The SDK never cancels server jobs.** Jobs already admitted keep running.
+
+Poll/backoff and concurrency waits use a wakeable cancellation event instead of
+`time.sleep`. The worst-case SDK waiting latency for cancellation is **50 ms**,
+independent of HTTP timeouts and the operation deadline, plus thread scheduling
+and the [deadline exceptions](#deadline-exceptions). Preparation and HTTP
+watchdogs enforce this bound; ordinary poll/backoff waits wake immediately on
+notification.
+The watchdog aborts the request body and shuts down the individual in-flight
+socket (`shutdown(SHUT_RDWR)` followed by close), or closes its response stream.
+It never closes the process-wide pool or another client's connections.
+Caller-owned HTTP clients retain their lifetime and ownership.
+
+The development lock uses httpx 0.28.1 / httpcore 1.0.9. Their
+[`Client.close()`](https://github.com/encode/httpx/blob/0.28.1/httpx/_client.py)
+closes transports; the
+[pool close path](https://github.com/encode/httpcore/blob/1.0.9/httpcore/_sync/connection_pool.py)
+ultimately uses
+[`socket.close()`](https://github.com/encode/httpcore/blob/1.0.9/httpcore/_backends/sync.py),
+without a cross-thread read-interruption latency guarantee. Cancellation therefore
+uses the SDK's per-exchange watchdog and explicit socket shutdown rather than
+relying on `httpx.Client.close()` from the cancelling thread.
+
+`AsyncMachinera` continues to use asyncio task cancellation; it has no `cancel()`
+method.
 
 #### `transcribe_file`
 
@@ -325,20 +429,43 @@ carry that `job_id` with `phase="poll"`, and staged errors carry `operation_key`
 any recovered IDs. A `ValueError` for an invalid argument carries none. Each continuation has
 its own total deadline and elapsed time. Job identifiers and arguments are validated locally.
 
+##### Staged upload recovery and expiry
+
 Initialization uses a stable key derived from the operation key; submission uses the operation key.
 Lost responses retry with unchanged keys and input. Conditional PUT 412 proceeds
 to submission to confirm the stored object. An expired PUT grant is refreshed by
 replaying initialization within the fixed `upload_expires_at` window; the stored
 response limits remain authoritative for that call.
 
+Initialization supplies the duration `limits.upload_window_seconds` and the
+absolute deadline `upload_expires_at` (Unix seconds), the fixed last time to submit
+and bind an unbound upload. These are service-supplied values for that upload,
+not a published universal minimum;
+the SDK exports no fixed upload-window duration. Refreshing a PUT grant does not
+extend this deadline. An unbound upload past it raises `upload_expired`
+(`UploadError`, HTTP 410), even within the guaranteed idempotency replay window;
+replaying initialization cannot reopen it under the same key. Accepted jobs follow
+[retention defaults](#retention-defaults) instead.
+
+For large files, allow each attempt enough time for preparation, hashing and a
+complete transfer. Size all pre-submission attempts and backoff to finish submission
+inside the service's effective upload window, accounting for elapsed time since
+initialization and repeated preparation or transfers. The initialization response
+is authoritative; if the effective upload window is unknown when planning a harness,
+the retention minimums alone cannot guarantee that its upload retries will fit.
+Increasing a call's `deadline` does not extend `upload_expires_at`.
+
 `upload_incomplete` (409) triggers at most one additional PUT and resubmission.
 `upload_integrity_mismatch` raises `IntegrityError` without another PUT; when a
 failed job reports it, the error is `TerminalIntegrityError`, which is also a
 `TerminalJobError`. `upload_limit_exceeded` is a 429, so it raises `RateLimitError`
-rather than `UploadError` and honors `Retry-After` under the normal retry policy. `upload_expired`, `upload_already_bound`,
-`idempotency_payload_mismatch`, `payload_too_large` and
-`staged_uploads_unavailable` are non-retryable by default; explicit envelope
-retry guidance takes precedence for replay-safe requests. When initialization is
+rather than `UploadError` and honors `Retry-After` under the normal retry policy. Envelope `retryable` governs the exception's `retryable` attribute and automatic retries
+of replay-safe requests under [retryable precedence](#retryable-precedence) and the
+[retry rules](#common-operation-exceptions). Consult the runtime `retryable` and
+`is_transient` attributes and the [public error reference](https://api.machinera.com/docs/errors);
+whether callers should repeat is decided by the [`is_transient` table](#machineraerror),
+not the envelope alone: `UploadError` and `AmbiguousSubmissionError` are
+`is_transient=False` regardless of envelope `retryable`. When initialization is
 refused with `staged_uploads_unavailable` before any grant, the call submits the same
 body once as an inline durable job under the same operation key (`phase` becomes
 `"job_submit"`) if the encoded body fits the service inline limit: the refusal's
@@ -357,8 +484,8 @@ closed clients, exhausted connection retries, and local I/O failures.
 and is never retried automatically. `APITimeoutError` covers HTTP phase timeouts where replay is safe;
 after-send synchronous failures follow [`sync_replay`](#synchronous-replay).
 `DeadlineExceededError` bounds total work and polling; `TranscriptionInterrupted`
-wraps keyboard interruption with recovery context. Both are `RecoverableJobError`. `TerminalJobError` reports an
-observed failed job, or a status other than `"queued"`, `"processing"`, or
+wraps keyboard interruption or `Machinera.cancel()` with recovery context. Both
+are `RecoverableJobError`. `TerminalJobError` reports an observed failed job, or a status other than `"queued"`, `"processing"`, or
 `"completed"` while polling. Local argument validation raises `ValueError` or `TypeError`.
 
 Safe retries keep the same encoded request and operation key. Authentication,
@@ -371,7 +498,8 @@ new job and a new charge, not a retry.
 ### `AsyncMachinera`
 
 Native asyncio equivalent of `Machinera`. Its keyword-only constructor has the
-same parameters and defaults, with these type substitutions:
+same parameters and defaults except for the blocking-only `cancel_on_interrupt`,
+with these type substitutions:
 
 - `http_client: httpx.AsyncClient | None = None`
 - `transport: Literal["auto", "job"] | httpx.AsyncBaseTransport = "auto"`
@@ -397,11 +525,8 @@ After closing starts, new calls raise `APIConnectionError`. Caller-owned HTTP
 clients remain open. Request construction, storage credential isolation, redirect
 refusal, and logging behavior are identical to the blocking client.
 
-Hashing, container inspection, opening, reading, and releasing files run via
-`asyncio.to_thread`. Uploads stream bounded chunks. Deadline watchdogs cancel
-awaited operations; cleanup waits for any in-flight local file operation before
-restoring the original offset or closing owned files. A stalled local file operation
-can delay exception delivery without blocking the event loop.
+Uploads stream bounded chunks. See [Deadline exceptions](#deadline-exceptions)
+for async local I/O and cleanup behavior.
 
 Task cancellation re-raises `asyncio.CancelledError` with safe recovery attributes
 `operation_key`, `upload_id`, `phase`, `job_id`, and `last_status` when the call has
@@ -442,7 +567,8 @@ remain positive and finite. Invalid values raise `ValueError` or `TypeError`.
 Each active HTTP phase is capped by the remaining total deadline; a GET is also
 capped by `poll_request`. A watchdog bounds the full exchange. The monotonic
 `deadline` includes preparation, concurrency waits, HTTP requests, retry sleeps,
-and polling. Explicit phase values use
+and polling, subject to the [deadline exceptions](#deadline-exceptions).
+Explicit phase values use
 [httpx inactivity semantics](https://www.python-httpx.org/advanced/timeouts/).
 
 ### `RetryPolicy`
@@ -624,6 +750,37 @@ Frozen Pydantic model with required `word: str`, `start: float`, and `end: float
 plus optional `confidence: float | None`. Timestamps are seconds. `word` retains
 empty strings and whitespace exactly; `raw` retains original fields and extras.
 
+## Retention defaults
+
+These minimums govern recovery of accepted jobs. Work not yet submitted is subject
+to the separate [staged upload recovery and expiry](#staged-upload-recovery-and-expiry)
+contract; retention does not extend an unbound upload's deadline.
+
+<!-- BEGIN GENERATED RETENTION -->
+Guaranteed minimums:
+
+- Idempotency replay window ≥ 1 day (86,400 s).
+- Result retention ≥ 3 days (259,200 s).
+
+Deployments may lengthen but never shorten either period below these defaults.
+<!-- END GENERATED RETENTION -->
+
+Regenerate this block with `PYTHONPATH=src python scripts/render_retention.py`.
+
+### `DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S`
+
+Availability is listed in the [CHANGELOG entry](CHANGELOG.md) that adds these constants.
+
+The SDK's snapshot of the service's guaranteed minimum idempotency replay window, in seconds.
+
+### `DEFAULT_RESULT_RETENTION_S`
+
+Availability is listed in the [CHANGELOG entry](CHANGELOG.md) that adds these constants.
+
+The SDK's snapshot of the service's guaranteed minimum result retention, in seconds.
+See the canonical
+[result and idempotency retention policy](https://api.machinera.com/docs/errors#retention).
+
 ## Files and uploads
 
 ### `SUPPORTED_MEDIA_SUFFIXES`
@@ -659,9 +816,9 @@ second job, so resume `job_id` instead. The same holds without a `job_id` once a
 submission for such a call was sent and its response lost, because the service may have
 accepted that job.
 
-With the caller's own key, repeating the identical call is always safe, because the
-service answers a repeated key with the original job, running or finished, and never
-runs or bills it twice, subject to [replay retention](https://github.com/machinera-labs/machinera-python/blob/main/README.md#recovery-after-a-restart). So is `resume(job_id)`, which only polls. For those calls,
+Repeating an identical caller-keyed call is safe (see [Failure handling](#failure-handling) and
+[Recovery after a restart](README.md#recovery-after-a-restart)
+for duplicate-charge and replay-retention guarantees), as is `resume(job_id)`, which only polls. For those calls,
 `is_transient` says only whether the SDK expects the repeat to succeed. For a
 caller-keyed call with no `job_id` and `is_transient=False`, the recovery exception to
 row 7 is an `InternalServerError` or `APIResponseValidationError` in `phase`
@@ -775,7 +932,7 @@ adds the keyword-only `ambiguous: bool` and forwards every other keyword to `API
 | `DeadlineExceededError` | `APIError`, `RecoverableJobError` | Call deadline, required wait, or explicit `max_polls` cap exhausted; recover accepted work. |
 | `AmbiguousSubmissionError` | `APIError` | Sync execution may have started; see row 4 of [Failure handling](#failure-handling). Controlled by [`sync_replay`](#synchronous-replay). |
 | `TerminalJobError` | `APIError` | Failed job observed during a status read, possibly HTTP 200, or an unrecognized status while polling; `last_status` holds the status. |
-| `UploadError` | `APIError` | Base upload failure type; every non-429 service error whose `code` starts with `upload_` raises it (or `IntegrityError`) instead of a status-specific class, except a failed job's `TerminalJobError`; `upload_not_found` is an `UploadError`, not a `NotFoundError`. Never transient. |
+| `UploadError` | `APIError` | Base upload failure type; every non-429 service error whose `code` starts with `upload_` raises it (or `IntegrityError`) instead of a status-specific class, except a failed job's `TerminalJobError`; `upload_not_found` is an `UploadError`, not a `NotFoundError`. See [retry guidance](#resume). |
 | `IntegrityError` | `UploadError` | Input changed during preparation or streaming. |
 | `TerminalIntegrityError` | `IntegrityError`, `TerminalJobError` | A job failed with `upload_integrity_mismatch`; resuming the same `job_id` cannot succeed. |
 | `TranscriptionInterrupted` | `APIError`, `RecoverableJobError`, `KeyboardInterrupt` | Interrupted operation with safe recovery context. Read-only `ambiguous: bool` is `True` when an unkeyed synchronous request was interrupted and may have run; see row 4 of [Failure handling](#failure-handling). |
@@ -784,8 +941,7 @@ Other unsuccessful HTTP statuses use `APIStatusError` directly.
 
 ### Failure handling
 
-- The SDK already retries what is safe to retry; see [Deadlines and
-  retries](https://github.com/machinera-labs/machinera-python/blob/main/README.md#deadlines-and-retries).
+- The SDK already retries what is safe to retry; see [RetryPolicy](#retrypolicy).
 - Use the first matching row. Rows 1–5 are for code that owns recovery.
 - Under an outer retry, `is_transient` means repeating the identical call, as made, is safe and may
   succeed; remembered `job_id` or key context also matters (rows 3 and 5). Pass `idempotency_key` on
@@ -798,11 +954,11 @@ Other unsuccessful HTTP statuses use `APIStatusError` directly.
 | --- | --- | --- |
 | 1 | `TranscriptionInterrupted` | Stop; `is_transient` is always `False`. Save `operation_key` and `job_id`, and continue later with the row that matches them. If `ambiguous` is `True`, follow row 4. |
 | 2 | `TerminalJobError`, including `TerminalIntegrityError` | The job failed; never `resume` it. Repeating the call with the same key replays this failed job and raises the same error. Record `code`. If `retryable` is `True`, a submission under a new key may succeed, as a new job and a new charge; `is_transient` is then `True` for an unkeyed call, whose repeat is that new submission, and `False` for a keyed call or `resume`. |
-| 3 | Any other `APIError` with `job_id` set | The job was accepted. Call `resume(job_id, response_format=...)` with the original format after a pause; it only polls and never charges again. A call with `idempotency_key` may instead be repeated as made when `is_transient` is `True`, which replays this job. If `resume` fails, a `TerminalJobError` follows row 2 and a non-transient 4xx such as `NotFoundError` is final for this job (row 7); any other failure, such as a 5xx, a malformed body, or a connection error, leaves the job unaffected, so `resume` again after a pause, within your own retry limit, whatever `is_transient` says. For a call without `idempotency_key`, `is_transient` is `False` here, because repeating that call would submit and bill a second job while this one may still run. |
+| 3 | Any other `APIError` with `job_id` set, excluding non-transient 4xx errors (row 7) | The job was accepted. Call `resume(job_id, response_format=...)` with the original format after a pause; it only polls and never charges again. A call with `idempotency_key` may instead be repeated as made when `is_transient` is `True`, which replays this job. A non-transient 4xx such as `NotFoundError` is final for this job (row 7), whether raised by the initial call or by `resume`: the initial call already polls the accepted job, and resuming repeats that same status read. A non-transient 4xx staged submission refusal also stays final even if initialization recovered a job ID; do not bypass original-option validation by resuming it. If `resume` fails, a `TerminalJobError` follows row 2; any other failure except a non-transient 4xx (row 7), such as a 5xx, a malformed body, or a connection error, leaves the job unaffected, so `resume` again after a pause, within your own retry limit, whatever `is_transient` says. For a call without `idempotency_key`, `is_transient` is `False` here, because repeating that call would submit and bill a second job while this one may still run. |
 | 4 | `AmbiguousSubmissionError` | An unkeyed synchronous request may have run (default `sync_replay="never"` only), and no SDK call can tell whether it did. Repeating it, with or without a key, may bill it again, so treat it as failed for this input unless a second charge is acceptable. A key on every call avoids this case. |
 | 5 | `RecoverableJobError` (`DeadlineExceededError`) without `job_id`, or a lost job submission: an `APIConnectionError` or status error with `retryable` `True`, without `job_id`, in `phase` `"job_submit"` or `"submit"` | By `phase`: `"prepare"` or `"concurrency_wait"`: nothing was sent; repeat the call as made. `"sync_submit"`: row 4 under the default, or repeat the call under `sync_replay="always"`. Any other phase: when `is_transient` is `True` (see the [`is_transient` table](https://github.com/machinera-labs/machinera-python/blob/main/api.md#machineraerror)), repeat the call as made; otherwise repeat the identical call with `idempotency_key=error.operation_key`, which replays the job if it was accepted, because a lost submission's job may have been accepted and repeating the call as made could submit and bill a second one. |
 | 6 | Any other error with `is_transient` `True` | Repeat the identical call, with the same key, after a pause. The SDK has already retried it. |
-| 7 | Anything else (`is_transient` `False`) | Permanent for this input, except for the [caller-keyed recovery exception](https://github.com/machinera-labs/machinera-python/blob/main/api.md#machineraerror). This covers `AuthenticationError`, `PermissionDeniedError`, `BadRequestError`, `UnprocessableEntityError`, `PayloadTooLargeError`, `NotFoundError`, `ConflictError`, `UploadError` and `IntegrityError`, a status error that `is_transient` does not make transient (a bare 500 under the default `sync_replay="never"`, for example), a 5xx on the synchronous route under that default (it may have run; see row 4), and `APIConnectionError` from a closed client, from local file I/O such as a missing path, or with `retryable` `False`. Record the class name, `code`, and `request_id`. A new key is a new submission and a new charge. |
+| 7 | Anything else (`is_transient` `False`) | Permanent for this input, including a non-transient 4xx with `job_id` set on either the initial call or `resume`, except for the [caller-keyed recovery exception](https://github.com/machinera-labs/machinera-python/blob/main/api.md#machineraerror). This covers `AuthenticationError`, `PermissionDeniedError`, `BadRequestError`, `UnprocessableEntityError`, `PayloadTooLargeError`, `NotFoundError`, `ConflictError`, `UploadError` and `IntegrityError`, a status error that `is_transient` does not make transient (a bare 500 under the default `sync_replay="never"`, for example), a 5xx on the synchronous route under that default (it may have run; see row 4), and `APIConnectionError` from a closed client, from local file I/O such as a missing path, or with `retryable` `False`. Record the class name, `code`, and `request_id`. A new key is a new submission and a new charge. |
 
 #### Retryable precedence
 

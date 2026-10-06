@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import random
+import signal
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from types import FrameType
 from typing import Any, BinaryIO, Literal, cast
 
 import httpx
@@ -26,7 +28,7 @@ from ._exceptions import (
     DeadlineExceededError,
 )
 from ._files import FileContent, FileInput, open_file
-from ._io import Exchange, keepalive_transport, run_bounded
+from ._io import Cancellation, Exchange, keepalive_transport, run_bounded
 from ._multipart import Multipart, UploadBody
 from ._pool import PoolKey, SharedTransport
 from ._types import (
@@ -44,6 +46,7 @@ from ._types import (
 class _Lifecycle:
     def __init__(self, max_concurrency: int | None) -> None:
         self.condition = threading.Condition()
+        self.cancellation = Cancellation()
         self.active = 0
         self.exchanges = 0
         self.closed = False
@@ -60,6 +63,7 @@ class Machinera(Core):
     _client_type = httpx.Client
     _lifecycle: _Lifecycle
     _sleeper: Callable[[float], None]
+    _restore_interrupt: Callable[[], None] | None
 
     def __init__(
         self,
@@ -72,6 +76,7 @@ class Machinera(Core):
         retry_policy: RetryPolicy | None = None,
         limits: Limits | None = None,
         max_concurrency: int | None = None,
+        cancel_on_interrupt: bool = False,
         transport: Literal["auto", "job"] | httpx.BaseTransport = "auto",
         sync_replay: Literal["never", "always"] = "never",
         http_client: httpx.Client | None = None,
@@ -80,6 +85,8 @@ class Machinera(Core):
         wall_clock: Callable[[], float] = time.time,
         random_source: Callable[[], float] = random.random,
     ) -> None:
+        if cancel_on_interrupt and threading.current_thread() is not threading.main_thread():
+            raise ValueError("cancel_on_interrupt requires construction on the main thread")
         super().__init__(
             api_key=api_key,
             base_url=base_url,
@@ -98,6 +105,24 @@ class Machinera(Core):
         )
         object.__setattr__(self, "_sleeper", sleeper)
         object.__setattr__(self, "_lifecycle", _Lifecycle(max_concurrency))
+        object.__setattr__(self, "_restore_interrupt", None)
+        if cancel_on_interrupt:
+            previous = signal.getsignal(signal.SIGINT)
+
+            def interrupt(signum: int, frame: FrameType | None) -> None:
+                self.cancel()
+                if callable(previous):
+                    previous(signum, frame)
+                elif previous == signal.SIG_DFL:
+                    signal.signal(signum, signal.SIG_DFL)
+                    signal.raise_signal(signum)
+
+            def restore() -> None:
+                if signal.getsignal(signal.SIGINT) is interrupt:
+                    signal.signal(signal.SIGINT, previous)
+
+            signal.signal(signal.SIGINT, interrupt)
+            object.__setattr__(self, "_restore_interrupt", restore)
 
     def _shared_transport(self, role: str) -> SharedTransport:
         if role == "poll":
@@ -115,15 +140,44 @@ class Machinera(Core):
     def __exit__(self, *args: object) -> None:
         self.close()
 
+    def cancel(self) -> None:
+        """Interrupt active and future operations locally; never cancel server jobs."""
+        self._lifecycle.cancellation.set()
+
+    def _sleep(self, delay: float) -> None:
+        cancellation = self._lifecycle.cancellation
+        if self._sleeper is time.sleep:
+            cancellation.wait(delay)
+        else:
+            run_bounded(
+                lambda: self._sleeper(delay),
+                float("inf"),
+                lambda: DeadlineExceededError("Sleep deadline exceeded"),
+                lambda: None,
+                self._exchange_finished,
+                starting=self._exchange_starting,
+                interrupted=cancellation.check,
+            )
+
     def close(self) -> None:
         """Wait for active calls, then close the HTTP clients the SDK created."""
+        if (
+            self._restore_interrupt is not None
+            and threading.current_thread() is not threading.main_thread()
+        ):
+            raise ValueError("cancel_on_interrupt requires close() on the main thread")
         life = self._lifecycle
-        with life.condition:
-            life.closed = True
-            while life.active:
-                life.condition.wait()
-            if self._owns_http and not life.exchanges:
-                self._close_http()
+        try:
+            with life.condition:
+                life.closed = True
+                while life.active:
+                    life.condition.wait()
+                if self._owns_http and not life.exchanges:
+                    self._close_http()
+        finally:
+            if self._restore_interrupt is not None:
+                self._restore_interrupt()
+                object.__setattr__(self, "_restore_interrupt", None)
 
     def _exchange_starting(self) -> None:
         with self._lifecycle.condition:
@@ -153,23 +207,30 @@ class Machinera(Core):
     ) -> Iterator[_Call]:
         call = self._new_call(timeout, deadline, key, phase=phase, **context)
         life = self._lifecycle
+        call.interrupted = life.cancellation.check
         with life.condition:
-            if life.closed:
+            if life.closed and not life.cancellation.cancelled:
                 raise self._closed_error(call)
             life.active += 1
         acquired = False
         failure: BaseException | None = None
         try:
+            call.interrupted()
             if life.semaphore is not None:
                 call.phase = "concurrency_wait" if phase == "prepare" else phase
                 while not life.semaphore.acquire(blocking=False):
-                    self._sleeper(min(0.05, call.remaining()))
+                    self._sleep(min(0.05, call.remaining()))
                 acquired = True
             call.remaining()
             call.phase = phase
             yield call
         except BaseException as error:
-            failure = self._classify(error, call, key, blocking=True)
+            failure = self._classify(
+                KeyboardInterrupt() if life.cancellation.cancelled else error,
+                call,
+                key,
+                blocking=True,
+            )
             if failure is None:
                 raise
         finally:
@@ -260,8 +321,7 @@ class Machinera(Core):
     @_sanitized
     def get_job(self, job_id: str, *, timeout: Timeout = UNSET) -> JobSnapshot:
         """Read one job snapshot, retrying only eligible transient read failures."""
-        with self._operation(timeout, None, caller_key=None) as call:
-            call.job_id = self._job_id(job_id)
+        with self._operation(timeout, None, caller_key=None, job_id=self._job_id(job_id)) as call:
             data, _ = self._run(self._read_job(call))
             return data
 
@@ -303,8 +363,10 @@ class Machinera(Core):
                 return cast(_T, done.value)
             value, error = None, None
             try:
+                if not isinstance(effect, CloseFile):
+                    self._lifecycle.cancellation.check()
                 if isinstance(effect, Sleep):
-                    self._sleeper(effect.delay)
+                    self._sleep(effect.delay)
                 elif isinstance(effect, OpenFile):
                     scope = self._file(effect.content, effect.call)
                     value = scope.__enter__()
@@ -322,6 +384,7 @@ class Machinera(Core):
                         effect.body.abort,
                         self._exchange_finished,
                         starting=self._exchange_starting,
+                        interrupted=self._lifecycle.cancellation.check,
                     )
                 else:
                     exchange = Exchange(
@@ -336,7 +399,9 @@ class Machinera(Core):
                         starting=self._exchange_starting,
                     )
                     try:
-                        value = exchange.run(effect.budget, effect.expired)
+                        value = exchange.run(
+                            effect.budget, effect.expired, self._lifecycle.cancellation.check
+                        )
                     finally:
                         with exchange.lock:
                             effect.response = exchange.response

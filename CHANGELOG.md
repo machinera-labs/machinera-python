@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.1.4 — 2026-10-06
+
+### Added
+
+- `Machinera(cancel_on_interrupt=True)` installs a SIGINT handler that cancels the
+  client before chaining to the prior handler. Construct and close on the main
+  thread; `close()` restores the handler. See the [cancellation contract](api.md#cancel).
+
+- `Machinera.cancel()` interrupts active and future blocking operations across
+  threads with `TranscriptionInterrupted`, retaining recovery context without
+  cancelling server jobs. See the [cancellation contract](api.md#cancel) for the
+  latency bound, including scheduling and local-work qualifications. The evaluation harness recipe now
+  enables SIGINT cancellation at module import before threads start.
+
+- Public constants `machinera.DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S` and
+  `machinera.DEFAULT_RESULT_RETENTION_S` expose the SDK's snapshot of the service's
+  guaranteed minimum idempotency replay window and result retention, in seconds;
+  see [Retention defaults](api.md#retention-defaults) for generated values.
+
 ## 0.1.3 — 2026-10-02
 
 ### Fixed
@@ -70,10 +89,9 @@
 
 ### Changed
 
-- Polling a pending job now continues until the call's deadline; a deadline you set
-  is the only thing that ends it. `RetryPolicy.max_polls` is now `int | None` and
-  defaults to `None` (no count limit); a positive value remains a hard cap on status
-  reads. Previously the default count cap could end a long job's polling with
+- Polling a pending job no longer has a default count cap. `RetryPolicy.max_polls`
+  is now `int | None` and defaults to `None` (no count limit); a positive value remains
+  a hard cap on status reads. Previously the default count cap could end a long job's polling with
   `DeadlineExceededError` well before a longer `deadline`.
 - With `transport="auto"`, a synchronous request refused before any work was admitted
   (`inline_claim_timeout`, `inline_admission_refused`, or `no_serving_capacity`, when
@@ -143,7 +161,8 @@
   sanitized recovery context. Service errors with an `upload_` code raise
   `UploadError`, except rate limits.
 - `APIResponseValidationError` for a malformed or unexpected response body,
-  including an upload initialization response or grant; it is never retried.
+  including an upload initialization response or grant; it is never retried automatically.
+  See the current [caller-keyed recovery policy](api.md#machineraerror).
 - `TerminalIntegrityError`, raised when a job fails because the uploaded file did not
   match; it is both an `IntegrityError` and a `TerminalJobError`.
 - A `machinera` logger with retry decisions at `DEBUG` and job status changes at
