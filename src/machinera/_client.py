@@ -341,7 +341,7 @@ class Machinera(Core):
         timeout: Timeout = UNSET,
         deadline: float | None = None,
     ) -> TranscriptionResult:
-        """Poll a known job or replay a staged operation with identical input and options."""
+        """Poll a known job or replay a file upload operation with identical input and options."""
         selected, context = self._resume_plan(
             job_id, file, operation_key, upload_id, model, language, response_format
         )

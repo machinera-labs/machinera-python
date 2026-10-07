@@ -20,7 +20,7 @@ from support import Clock, Service, accepted, completed, failed_job, queued, una
 import machinera
 from machinera._contract import (
     DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S,
-    DEFAULT_INLINE_CAP_BYTES,
+    DEFAULT_MULTIPART_CAP_BYTES,
     DEFAULT_RESULT_RETENTION_S,
     ERROR_CODES,
 )
@@ -126,25 +126,25 @@ def test_readme_long_jobs_qualifies_collection_with_retention() -> None:
         ("- Recovery is limited", "For accepted jobs, size", "Recovery does not extend retention."),
     ],
 )
-def test_retention_recovery_claim_scopes_accepted_jobs_and_cites_upload_expiry(
+def test_retention_recovery_capture_scopes_accepted_jobs_and_cites_upload_expiry(
     section: str, start: str, end: str
 ) -> None:
     text = README.split(section, 1)[1].split("\n- ", 1)[0]
-    claim = " ".join((start + text.split(start, 1)[1].split(end, 1)[0]).split())
-    assert "whole retry sequence" in claim
-    assert "accepted job" in claim
-    assert "work not yet submitted instead follows" in claim
+    capture = " ".join((start + text.split(start, 1)[1].split(end, 1)[0]).split())
+    assert "whole retry sequence" in capture
+    assert "accepted job" in capture
+    assert "work not yet submitted instead follows" in capture
     target = (
         "https://github.com/machinera-labs/machinera-python/blob/main/"
-        "api.md#staged-upload-recovery-and-expiry"
+        "api.md#file-upload-recovery-and-expiry"
     )
-    assert f"[staged upload recovery and expiry]({target})" in claim
+    assert f"[file upload recovery and expiry]({target})" in capture
 
 
 def test_grouped_numbers_in_docs_are_documented_defaults() -> None:
     allowed = {
         *expected_defaults().values(),
-        str(DEFAULT_INLINE_CAP_BYTES),
+        str(DEFAULT_MULTIPART_CAP_BYTES),
         str(DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S),
         str(DEFAULT_RESULT_RETENTION_S),
     }
@@ -188,11 +188,11 @@ def test_readme_lists_the_supported_suffixes() -> None:
 
 def test_job_error_codes_match_the_contract() -> None:
     codes = table(REFERENCE, "| Code | Retryable | Meaning |")
-    rows = re.findall(r"^\| `([a-z_]+)` \| `(True|False)` \|", codes, re.MULTILINE)
+    rows = re.findall(r"^\| `([0-9]+)` \| `(True|False)` \|", codes, re.MULTILINE)
     job_codes = {code for code, entry in ERROR_CODES.items() if entry.status == 200}
-    assert {code for code, _ in rows} == job_codes
+    assert {int(code) for code, _ in rows} == job_codes
     for code, retryable in rows:
-        assert str(ERROR_CODES[code].retryable) == retryable
+        assert str(ERROR_CODES[int(code)].retryable) == retryable
     assert (
         "[job-code table](https://github.com/machinera-labs/machinera-python/blob/main/api.md#joberror)"
         in README
@@ -229,6 +229,7 @@ def readme_provider(
     provider.digests = {}
     provider.hashing = {}
     provider.jobs = {}
+    provider.uploads = {}
     derive = provider.operation_key
 
     def slow_key(audio: str | bytes, language: str) -> object:
@@ -441,10 +442,10 @@ def test_unsent_unkeyed_job_submission_is_repeated_as_made() -> None:
 @pytest.mark.parametrize(
     "poll",
     [
-        pytest.param(lambda n: failed_job("job_shed", True), id="retryable-failed-job"),
-        pytest.param(lambda n: failed_job("result_unreadable", False), id="failed-job"),
+        pytest.param(lambda n: failed_job(5006, True), id="retryable-failed-job"),
+        pytest.param(lambda n: failed_job(5011, False), id="failed-job"),
         pytest.param(
-            lambda n: unavailable() if n <= ATTEMPTS else failed_job("job_shed", True),
+            lambda n: unavailable() if n <= ATTEMPTS else failed_job(5006, True),
             id="failed-job-after-transient-reads",
         ),
         pytest.param(lambda n: httpx.Response(404, json={}), id="job-not-found"),
@@ -531,7 +532,7 @@ def test_readme_provider_recipe_resumes_after_a_rate_limited_status_read() -> No
 
     def poll(n: int) -> httpx.Response:
         if n <= ATTEMPTS:
-            return httpx.Response(429, json={"error": {"code": "rate_limited"}})
+            return httpx.Response(429, json={"error": {"code": 3999}})
         return completed("hi")
 
     provider = readme_provider(job_service(requests, lambda n: accepted(), poll), clock)
@@ -635,9 +636,9 @@ def test_readme_provider_recipe_shares_one_key_for_identical_bytes(tmp_path: Pat
     assert bodies[0] == bodies[1] and bodies[2] == bodies[3]
 
 
-def test_readme_provider_recipe_keys_cover_staged_upload_metadata(tmp_path: Path) -> None:
+def test_readme_provider_recipe_keys_cover_file_upload_upload_metadata(tmp_path: Path) -> None:
     # One MP4-container file under two suffixes and as bytes: the suffix sets the media
-    # type of a staged upload, so each input must get its own key, and repeating an input
+    # type of a file upload, so each input must get its own key, and repeating an input
     # must reproduce the same upload initialization exactly.
     container = (16).to_bytes(4, "big") + b"ftypisom" + bytes(4) + bytes(64)
     inputs: list[str | bytes] = []
@@ -739,7 +740,7 @@ def test_readme_recipes_hash_a_path_in_bounded_chunks(tmp_path: Path) -> None:
     assert_bounded_reads(sizes)
     digest = hashlib.sha256(content).hexdigest()
     options = "transcribe-v1:en:json"
-    expected = hashlib.sha256(f"my-eval:sample-0001:{options}:{digest}".encode()).hexdigest()
+    expected = hashlib.sha256(f"my-run:sample-0001:{options}:{digest}".encode()).hexdigest()
     assert keys == [expected]
 
 
@@ -763,8 +764,10 @@ def test_reference_lists_match_the_sdk() -> None:
     assert {name.lower() for name in headers} == _RESERVED
     assert listed(REFERENCE, "the recognized types are", "Without a type") == set(_MIME_SUFFIXES)
     replayable = listed(REFERENCE, "proving the request did not run (", ")")
-    assert replayable == SYNC_REPLAYABLE_CODES
-    assert listed(REFERENCE, "except the job-fallback refusals (", ")") == SYNC_FALLBACK_CODES
+    assert {int(code) for code in replayable} == SYNC_REPLAYABLE_CODES
+    assert {
+        int(code) for code in listed(REFERENCE, "except the job-fallback refusals (", ")")
+    } == SYNC_FALLBACK_CODES
 
 
 def test_every_export_has_reference_entry() -> None:
@@ -909,7 +912,7 @@ def test_both_clients_are_exported() -> None:
 
 
 def test_job_transport_and_resume_signatures() -> None:
-    assert "job_inline_body_bytes" in inspect.signature(machinera.Limits).parameters
+    assert "job_multipart_body_bytes" in inspect.signature(machinera.Limits).parameters
     for cls in (machinera.Machinera, machinera.AsyncMachinera):
         assert "phase" not in inspect.signature(cls.resume).parameters
         with pytest.raises(ValueError, match="auto, job"):
@@ -992,10 +995,10 @@ def test_readme_import_time_client_owns_interrupts() -> None:
         with pytest.raises(KeyboardInterrupt) as caught:
             signal.raise_signal(signal.SIGINT)
         assert type(caught.value) is KeyboardInterrupt
-        with pytest.raises(KeyboardInterrupt) as worker_error:
+        with pytest.raises(KeyboardInterrupt) as thread_error:
             provider.transcribe(WAV)
-        assert type(worker_error.value) is KeyboardInterrupt
-        assert isinstance(worker_error.value.__cause__, machinera.TranscriptionInterrupted)
+        assert type(thread_error.value) is KeyboardInterrupt
+        assert isinstance(thread_error.value.__cause__, machinera.TranscriptionInterrupted)
     finally:
         for client in clients:
             client.close()
@@ -1078,7 +1081,7 @@ def test_readme_provider_stops_on_initial_poll_not_found() -> None:
         job_service(
             requests,
             lambda n: accepted(),
-            lambda n: httpx.Response(404, json={"error": {"code": "job_not_found"}}),
+            lambda n: httpx.Response(404, json={"error": {"code": 1036}}),
         ),
         clock,
     )

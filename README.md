@@ -5,17 +5,21 @@ and a native asyncio client (`AsyncMachinera`) with the same methods. The
 [API reference](https://github.com/machinera-labs/machinera-python/blob/main/api.md)
 is the authority for every behavior summarized here.
 
+SDK 0.2.0 requires the numeric-code API. Error and warning `code` values are
+integers; string codes are unsupported. SDK 0.1.x cannot talk to the server after
+this API cut. Record the integer `error.code` and `error.request_id` for support.
+
 ## Install and pin
 
 ```sh
-pip install "machinera==0.1.4"
+pip install "machinera==0.2.0"
 export MACHINERA_API_KEY="your-api-key"
 ```
 
 APIs listed under [CHANGELOG “Unreleased”](https://github.com/machinera-labs/machinera-python/blob/main/CHANGELOG.md#unreleased)
 require the next release and are not available in the pin above.
 
-- Python 3.10 through 3.14. No audio decoder or conversion tools are needed.
+- Python 3.10 through 3.14. No audio decoding or conversion tools are needed.
 - Pin an exact version where installs must be reproducible. During `0.x`, minor
   releases may change the public API and patch releases are compatible fixes; read the
   [changelog](https://github.com/machinera-labs/machinera-python/blob/main/CHANGELOG.md)
@@ -39,15 +43,15 @@ Each call blocks until the transcript is finished and returns a `TranscriptionRe
 Every submission may incur usage charges.
 
 - **Model:** `transcribe-v1` is the only model ID this SDK documents. There is no
-  model-listing call; another ID fails with `BadRequestError`, code `unknown_model`.
+  model-listing call; another ID fails with `BadRequestError`, code `1009`.
 - **English only:** the SDK checks the `language` hint locally: it accepts `None`,
   `"en"`, or an `en-*` tag, and any other value raises `ValueError` before any request;
   treat it as a permanent failure. The SDK never inspects the audio. The service may
-  reject audio it detects as not English with code `non_english_audio`, which is
+  reject audio it detects as not English with code `1029`, which is
   permanent: `UnprocessableEntityError` at submission, or `TerminalJobError` for an
   accepted job. Whether the service applies that check is decided by the service, not
   the SDK; see the
-  [error reference](https://api.machinera.com/docs/errors#non_english_audio). Send
+  [error reference](https://api.machinera.com/docs/errors/1029). Send
   `language="en"` to assert English.
 - **No prompt:** there is no prompt, vocabulary, or context parameter. Drop such inputs.
 - **Formats:** the suffixes in `SUPPORTED_MEDIA_SUFFIXES` (`flac`, `m4a`, `mp3`, `mp4`,
@@ -77,7 +81,7 @@ Every submission may incur usage charges.
 | Call | Route |
 | --- | --- |
 | `transcribe_url(...)` | Always a durable job (a server-side job resumable by ID). |
-| `transcribe_file(...)` with `idempotency_key`, or a client with `transport="job"` | Durable job: inline up to `Limits.job_inline_body_bytes` (52,428,800) encoded bytes, a staged upload above it. |
+| `transcribe_file(...)` with `idempotency_key`, or a client with `transport="job"` | Durable job: multipart up to `Limits.job_multipart_body_bytes` (52,428,800) encoded bytes, a file upload above it. |
 | `transcribe_file(...)` without a key, default `transport="auto"` | One synchronous request up to `Limits.sync_inline_body_bytes` (26,214,400) encoded bytes; above that, as with a key. |
 
 Encoded size is the file plus a few hundred bytes of multipart framing; a size equal to
@@ -127,9 +131,12 @@ a failed job whose code the SDK does not know, sent without the service's flag, 
 With your own `idempotency_key`, repeating the identical call never runs or bills it
 twice; returning the original job/result depends on replay retention (see
 [Recovery after a restart](#recovery-after-a-restart)). `is_transient` then says only whether the repeat may succeed.
+After upload replacement, `is_transient` is `False`: retain the current
+`operation_key` and `upload_id` and use file `resume(...)` (or `resume(job_id)`
+when known). The recipes below retain this context across outer retries.
 A keyed job submission that was sent but ended without a `job_id` in a non-transient
 5xx or `APIResponseValidationError` may have been accepted, so repeating it with the
-same key, within your own retry limit, may still return the job.
+current key and upload ID, within your own retry limit, may still return the job.
 
 Bound rows 3, 5, and 6 with your own budget, for example 3 attempts with pauses of 2,
 4, and 8 seconds. `str(error)` ends with `(request_id: ...)` when it is known; read
@@ -157,7 +164,10 @@ import time
 from pathlib import Path
 
 from machinera import (
+    APIConnectionError,
     APIResponseValidationError,
+    APIStatusError,
+    DeadlineExceededError,
     InternalServerError,
     Machinera,
     MachineraError,
@@ -165,7 +175,7 @@ from machinera import (
     TranscriptionInterrupted,
 )
 
-RUN = "my-eval-2026-10-05"  # a new value transcribes every sample again
+RUN = "my-run-2026-10-05"  # a new value transcribes every sample again
 MODEL, FORMAT = "transcribe-v1", "json"
 BUDGET = 300  # seconds per attempt, counted from before hashing; hashing is not cut short
 
@@ -176,6 +186,7 @@ class MachineraProvider:
         self.digests: dict[tuple[str, int, int], str] = {}  # (path, size, mtime) -> hash
         self.hashing: dict[str, threading.Lock] = {}  # one thread hashes a path at a time
         self.jobs: dict[str, str] = {}  # key -> a job_id an earlier error carried
+        self.uploads: dict[str, tuple[str, str | None]] = {}
 
     def transcribe(self, audio: str | bytes, language: str = "en") -> str:
         end = time.monotonic() + BUDGET
@@ -183,18 +194,27 @@ class MachineraProvider:
             key = self.operation_key(audio, language)
             return self.call(audio, language, key, end)
         except TranscriptionInterrupted as exc:
-            if exc.job_id is not None:
-                self.jobs[key] = exc.job_id
+            self.remember(key, exc)
             raise KeyboardInterrupt from exc  # it is also an Exception, which a harness retries
         except MachineraError as exc:
-            job_id = getattr(exc, "job_id", None)
-            if job_id is not None and not isinstance(exc, TerminalJobError):
-                self.jobs[key] = job_id  # later attempts resume it, which never charges again
+            self.remember(key, exc)
             if worth_retrying(exc):
                 raise  # the harness's retry repeats or resumes; neither bills twice
             raise PermanentError(str(exc)) from exc
         except (ValueError, TypeError, OSError) as exc:  # such as a missing path
             raise PermanentError(str(exc)) from exc
+
+    def remember(self, key: str, error: MachineraError) -> None:
+        job_id = getattr(error, "job_id", None)
+        if job_id is not None and not isinstance(error, TerminalJobError):
+            self.jobs[key] = job_id
+        operation_key = getattr(error, "operation_key", None)
+        upload_id = getattr(error, "upload_id", None)
+        if operation_key and (
+            upload_id is not None
+            or getattr(error, "phase", None) in ("upload_init", "upload_put", "submit")
+        ):
+            self.uploads[key] = (operation_key, upload_id)
 
     def call(self, audio: str | bytes, language: str, key: str, end: float) -> str:
         remaining = end - time.monotonic()
@@ -204,6 +224,18 @@ class MachineraProvider:
         if job_id is not None:  # poll the job; never upload or submit it again
             return self.client.resume(job_id, response_format=FORMAT, deadline=remaining).text
         name = None if isinstance(audio, bytes) else "upload" + Path(audio).suffix.lower()
+        if key in self.uploads:
+            operation_key, upload_id = self.uploads[key]
+            return self.client.resume(
+                file=audio,
+                model=MODEL,
+                language=language,
+                response_format=FORMAT,
+                filename=name,
+                operation_key=operation_key,
+                upload_id=upload_id,
+                deadline=remaining,
+            ).text
         return self.client.transcribe_file(
             audio,
             model=MODEL,
@@ -242,6 +274,20 @@ def worth_retrying(exc: MachineraError) -> bool:
         return False  # rows 1 and 2 take precedence even if a failed job is transient
     if exc.is_transient:
         return True
+    upload = getattr(exc, "operation_key", None) and getattr(exc, "phase", None) in (
+        "upload_init",
+        "upload_put",
+        "submit",
+    )
+    if upload and (
+        isinstance(exc, DeadlineExceededError)
+        or (
+            isinstance(exc, (APIConnectionError, APIStatusError))
+            and exc.retryable is True
+            and status not in (401, 403)
+        )
+    ):
+        return True  # resume saved upload context; do not repeat the original key
     if 400 <= status < 500:
         return False  # row 7, even with a job_id from the initial call
     if getattr(exc, "job_id", None) is not None:
@@ -259,7 +305,7 @@ Every provider object and the harness's threads share one module-level `CLIENT`.
 Calling `cancel()` affects every active and future operation on that shared instance;
 see the [cancellation contract](https://github.com/machinera-labs/machinera-python/blob/main/api.md#cancel).
 Construct the client at module import on the main thread, before the harness starts
-its worker threads:
+its threads:
 
 ```python
 CLIENT = Machinera(cancel_on_interrupt=True)
@@ -293,9 +339,9 @@ def run_samples(samples: list[str]) -> list[str]:
   The harness's retry limit bounds recovery. The
   [retention minimums](https://github.com/machinera-labs/machinera-python/blob/main/api.md#retention-defaults)
   are guaranteed: a harness whose whole retry sequence (attempts × budget + backoff)
-  finishes inside the replay-window minimum can recover an accepted job by key;
+  finishes inside the replay-period minimum can recover an accepted job by key;
   work not yet submitted instead follows
-  [staged upload recovery and expiry](https://github.com/machinera-labs/machinera-python/blob/main/api.md#staged-upload-recovery-and-expiry).
+  [file upload recovery and expiry](https://github.com/machinera-labs/machinera-python/blob/main/api.md#file-upload-recovery-and-expiry).
   Include any time beyond the budget caused by pre-call hashing or the documented
   deadline exceptions.
   Errors that `worth_retrying` rejects
@@ -332,9 +378,9 @@ def run_samples(samples: list[str]) -> list[str]:
   the same `RUN` to collect it while the [replay binding and result retention](https://github.com/machinera-labs/machinera-python/blob/main/api.md#retention-defaults) hold,
   or raise `BUDGET` for long files, or for large files on
   a slow connection, whose upload restarts on every attempt, as does the SDK's own
-  hashing pass over a staged file, inside the SDK's `deadline`. Size these attempts
-  and pauses using the [staged upload recovery and expiry contract](https://github.com/machinera-labs/machinera-python/blob/main/api.md#staged-upload-recovery-and-expiry),
-  which supplies no universal minimum upload window.
+  hashing pass over a uploaded file, inside the SDK's `deadline`. Size these attempts
+  and pauses using the [file upload recovery and expiry contract](https://github.com/machinera-labs/machinera-python/blob/main/api.md#file-upload-recovery-and-expiry),
+  which supplies no universal minimum upload duration.
 - **Latency:** each sample's time includes job submission, waiting to start, and polling every
   [`RetryPolicy.poll_interval`](https://github.com/machinera-labs/machinera-python/blob/main/api.md#retrypolicy). `inference_seconds` on the result,
   when the service returns it, is the service's own processing time. A key from an
@@ -406,7 +452,10 @@ import time
 
 from machinera import (
     APIError,
+    APIConnectionError,
     APIResponseValidationError,
+    APIStatusError,
+    DeadlineExceededError,
     InternalServerError,
     Machinera,
     MachineraError,
@@ -423,14 +472,24 @@ def transcribe(client: Machinera, sample_id: str, path: str) -> str:
         for chunk in iter(lambda: audio.read(1 << 20), b""):  # 1 MiB at a time
             content.update(chunk)
     options = "transcribe-v1:en:json"  # model, language, and format
-    key = hashlib.sha256(
-        f"my-eval:{sample_id}:{options}:{content.hexdigest()}".encode()
-    ).hexdigest()
+    key = hashlib.sha256(f"my-run:{sample_id}:{options}:{content.hexdigest()}".encode()).hexdigest()
     job_id = None
+    upload = None
     for attempt in range(3):
         try:
             if job_id is not None:
                 return client.resume(job_id, response_format="json", deadline=DEADLINE).text
+            if upload is not None:
+                operation_key, upload_id = upload
+                return client.resume(
+                    file=path,
+                    model="transcribe-v1",
+                    language="en",
+                    response_format="json",
+                    operation_key=operation_key,
+                    upload_id=upload_id,
+                    deadline=DEADLINE,
+                ).text
             return client.transcribe_file(
                 path,
                 model="transcribe-v1",
@@ -446,7 +505,24 @@ def transcribe(client: Machinera, sample_id: str, path: str) -> str:
             status = getattr(error, "status_code", None) or 0
             if accepted and job_id is None:
                 job_id = accepted  # row 3: poll the accepted job from now on
-            if not error.is_transient:
+            phase = getattr(error, "phase", None)
+            if (
+                isinstance(error, APIError)
+                and error.operation_key
+                and (
+                    error.upload_id is not None or phase in ("upload_init", "upload_put", "submit")
+                )
+            ):
+                upload = (error.operation_key, error.upload_id)
+            recover_upload = upload is not None and (
+                isinstance(error, DeadlineExceededError)
+                or (
+                    isinstance(error, (APIConnectionError, APIStatusError))
+                    and error.retryable is True
+                    and status not in (401, 403)
+                )
+            )
+            if not error.is_transient and not recover_upload:
                 submitting = getattr(error, "phase", None) in ("job_submit", "submit")
                 recoverable = submitting and isinstance(
                     error, (InternalServerError, APIResponseValidationError)
@@ -465,28 +541,30 @@ Every call here is keyed, so rows 4 and 5's `"sync_submit"` case cannot occur.
 
 ## Long files
 
-An encoded file above `Limits.job_inline_body_bytes` (52,428,800 bytes) is uploaded to
+An encoded file above `Limits.job_multipart_body_bytes` (52,428,800 bytes) is uploaded to
 storage and then submitted as a job, automatically. The service sets the upload size
-limit, the upload expiry window, and the maximum audio duration (code
-`audio_duration_exceeded`); see the [public limits](https://api.machinera.com/docs/limits).
+limit, the upload expiry period, and the maximum audio duration (code
+`1015`); see the [public limits](https://api.machinera.com/docs/limits).
 
 - Keeping the file immutable across attempts is the caller's obligation. Changes
   detected during SDK preparation or streaming raise `IntegrityError`; see
   [`transcribe_file`](https://github.com/machinera-labs/machinera-python/blob/main/api.md#transcribe_file).
 - Set `deadline` for the whole job, including waiting to start. A deadline only stops waiting:
   the job keeps running and `resume(error.job_id)` picks it up.
-- Before submission, `upload_expired` (`UploadError`, HTTP 410) ends recovery under
-  that upload key; see [staged upload recovery and expiry](https://github.com/machinera-labs/machinera-python/blob/main/api.md#staged-upload-recovery-and-expiry)
+- A definitive `1003` at job submission starts a fresh upload within the retry
+  budget and original deadline. Exhaustion raises non-transient `UploadError`; see [file upload recovery and expiry](https://github.com/machinera-labs/machinera-python/blob/main/api.md#file-upload-recovery-and-expiry)
   for the separate upload deadline and how to size retries.
-- `upload_already_bound` or `idempotency_payload_mismatch`: the key was reused with
+- `1005` or `1031`: the key was reused with
   different input or options; fix the key derivation.
 
 ## Recovery after a restart
 
-Save an operation key **before** calling, then save `job_id` from any error.
+Save an operation key **before** calling, then save the current `operation_key`,
+`upload_id`, and `job_id` from any error. A replacement upload rotates the key.
 These two fragments use application-provided durable storage: implement
-`save_recovery_state(key=..., job_id=...)`, and load its fields into `saved_key` and
-`saved_job_id` before running the restart fragment. Complete programs are linked below:
+`save_recovery_state(key=..., upload_id=..., job_id=...)`, and load its fields into
+`saved_key`, `saved_upload_id`, and `saved_job_id` before running the restart fragment.
+The storage update must preserve any already-known job ID. Complete programs are linked below:
 
 ```python
 import uuid
@@ -494,14 +572,15 @@ import uuid
 from machinera import APIError, Machinera
 
 key = uuid.uuid4().hex
-save_recovery_state(key=key, job_id=None)  # your own durable storage
+save_recovery_state(key=key, upload_id=None, job_id=None)  # your own durable storage
 
 with Machinera() as client:
     try:
         result = client.transcribe_file("recording.wav", model="transcribe-v1", idempotency_key=key)
     except APIError as error:
-        if error.job_id is not None:  # never replace a saved job_id with None
-            save_recovery_state(key=key, job_id=error.job_id)
+        save_recovery_state(
+            key=error.operation_key or key, upload_id=error.upload_id, job_id=error.job_id
+        )
         raise
 ```
 
@@ -511,17 +590,25 @@ After a restart:
 with Machinera() as client:
     if saved_job_id is not None:
         result = client.resume(saved_job_id, response_format="json")  # polls only
+    elif saved_upload_id is not None:
+        result = client.resume(
+            file="recording.wav",
+            model="transcribe-v1",
+            operation_key=saved_key,
+            upload_id=saved_upload_id,
+            response_format="json",
+        )
     else:
-        result = client.transcribe_file(  # replays the original submission
+        result = client.transcribe_file(  # replays the saved operation
             "recording.wav", model="transcribe-v1", idempotency_key=saved_key
         )
 ```
 
-- This covers inline and staged files alike. Reuse a key only for the identical
+- This covers multipart and uploaded files alike. Reuse a key only for the identical
   request: same file bytes, options, credential, and endpoint.
 - `resume` has two forms. `resume(job_id)` only polls and defaults to
   `response_format="verbose_json"`. `resume(file=..., model=..., operation_key=...)`
-  replays a staged submission and defaults to `"json"`. Pass the original format to
+  replays a file upload submission and defaults to `"json"`. Pass the original format to
   either.
 - A job that failed (`TerminalJobError`) stays failed: the same key replays the failure.
 - Recovery is limited for accepted jobs by the public API's
@@ -532,10 +619,10 @@ with Machinera() as client:
   that adds these constants.
   A finished job and its binding are kept at least the longer of the two.
   For accepted jobs, size retries and pauses against the cited minimums so that the
-  whole retry sequence finishes inside the guaranteed replay window; work not yet
-  submitted instead follows [staged upload recovery and expiry](https://github.com/machinera-labs/machinera-python/blob/main/api.md#staged-upload-recovery-and-expiry).
+  whole retry sequence finishes inside the guaranteed replay period; work not yet
+  submitted instead follows [file upload recovery and expiry](https://github.com/machinera-labs/machinera-python/blob/main/api.md#file-upload-recovery-and-expiry).
   Recovery does not extend retention.
-  After expiry a replay fails with `ConflictError`, code `idempotency_replay_unavailable`.
+  After expiry a replay fails with `ConflictError`, code `1030`.
   Keep `job_id` to `resume(job_id)` if a running job's binding expires;
   a new key submits and charges anew.
 - The SDK never cancels a server job and keeps no journal on disk.
@@ -560,7 +647,8 @@ The SDK retries network failures and the status errors that the rule under
 [Failure handling](https://github.com/machinera-labs/machinera-python/blob/main/api.md#failure-handling) makes transient, only when resending is safe or
 `sync_replay="always"` allows it. Pauses are
 `min(initial_delay * 2**retry, max_delay)` times a random factor in `[0.75, 1]`, and a
-`Retry-After` header sets a minimum. A pause that cannot finish before the deadline
+`Retry-After` header with a positive value sets a minimum. `Retry-After: 0` means
+no known timed minimum; bounded backoff still applies. A pause that cannot finish before the deadline
 raises `DeadlineExceededError`. `max_retries=n` is shorthand for `n + 1` attempts.
 
 ## Logging

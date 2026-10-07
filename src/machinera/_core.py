@@ -23,16 +23,21 @@ from urllib.parse import quote
 import httpx
 from pydantic import ValidationError
 
-from . import _codes
 from ._contract import (
-    DEFAULT_INLINE_CAP_BYTES,
+    DEFAULT_MULTIPART_CAP_BYTES,
     ERROR_CODES,
     RESPONSE_FORMATS,
     RETRYABLE_CODES,
     SERVED_LANGUAGE,
+    SYNC_CAP_FALLBACK_CODES,
+    SYNC_FALLBACK_CODES,
+    UPLOAD_ERROR_CODES,
+    UPLOAD_EXPIRED_CODES,
+    UPLOAD_INCOMPLETE_CODES,
+    UPLOAD_INTEGRITY_CODES,
+    UPLOADS_UNAVAILABLE_CODES,
 )
 from ._exceptions import (
-    SYNC_FALLBACK_CODES,
     AmbiguousSubmissionError,
     APIConnectionError,
     APIError,
@@ -75,10 +80,17 @@ from ._types import (
     positive,
     resolve_timeout,
 )
-from ._uploads import Grant, UploadPhase, descriptor, initialization_key, storage_code
+from ._uploads import (
+    Grant,
+    UploadPhase,
+    descriptor,
+    initialization_key,
+    replacement_key,
+    storage_code,
+)
 from ._version import __version__
 
-_SIZE_REFUSAL_CODES = (None, _codes.sync_size_cap.code, _codes.inline_body_over_cap.code)
+_SIZE_REFUSAL_CODES = {None, *SYNC_CAP_FALLBACK_CODES}
 _PENDING_STATUSES = ("queued", "processing")
 _SECONDS = re.compile(r"[0-9]+(?:\.[0-9]*)?|\.[0-9]+")
 
@@ -179,6 +191,7 @@ class _Call:
     # True once a job submission was sent and its response lost: the service may have
     # accepted a job whose ID the SDK never saw.
     submission_lost: bool = False
+    key_rotated: bool = False
     interrupted: Callable[[], None] = lambda: None
 
     def remaining(self) -> float:
@@ -303,7 +316,7 @@ class Core:
             or url.fragment
             or url.path.rstrip("/") not in ("", "/v1")
         ):
-            raise ValueError("base_url must be an HTTP(S) API origin, optionally followed by /v1")
+            raise ValueError("base_url must be an HTTP(S) API address, optionally followed by /v1")
         if sync_replay not in ("never", "always"):
             raise ValueError("sync_replay must be never or always")
         if not isinstance(api_key, str) or not re.fullmatch(r"[!-~]+", api_key):
@@ -382,7 +395,10 @@ class Core:
         detail = data.get("error", {}) if isinstance(data, dict) else {}
         if not isinstance(detail, dict):
             detail = {}
-        code = self._safe_token(detail.get("code"))
+        value = detail.get("code")
+        if value is not None and type(value) is not int:
+            raise invalid_response("Invalid error code", status_code=response.status_code)
+        code = value if type(value) is int else None
         guidance = detail.get("retryable")
         retryable = guidance if isinstance(guidance, bool) else None
         if retryable is None:
@@ -404,9 +420,9 @@ class Core:
         }.get(status, InternalServerError if 500 <= status < 600 else APIStatusError)
         if terminal:
             cls = TerminalJobError
-        elif code is not None and code.startswith("upload_") and status != 429:
+        elif code in UPLOAD_ERROR_CODES and status != 429:
             cls = UploadError
-        if code == _codes.upload_integrity_mismatch.code:
+        if code in UPLOAD_INTEGRITY_CODES:
             cls = TerminalIntegrityError if terminal else IntegrityError
         body: dict[str, object] | None = None
         if isinstance(data, dict):
@@ -420,17 +436,17 @@ class Core:
                 if value is not None:
                     body[name] = value
         message = "Transcription job failed" if terminal else "Machinera API request failed"
-        inline_cap: int | None = None
-        if code == _codes.staged_uploads_unavailable.code:
+        multipart_cap: int | None = None
+        if code in UPLOADS_UNAVAILABLE_CODES:
             message = (
-                "Staged uploads are unavailable, and the body cannot be sent inline: it "
-                "exceeds the service inline limit or an upload was already granted"
+                "File uploads are unavailable, and the body cannot be sent as multipart: it "
+                "exceeds the service multipart limit or an upload was already granted"
             )
             limits = detail.get("limits")
             if not isinstance(limits, dict) and isinstance(data, dict):
                 limits = data.get("limits")
             cap = limits.get("async_inline_body_bytes") if isinstance(limits, dict) else None
-            inline_cap = cap if type(cap) is int and cap > 0 else DEFAULT_INLINE_CAP_BYTES
+            multipart_cap = cap if type(cap) is int and cap > 0 else DEFAULT_MULTIPART_CAP_BYTES
         error = cls(
             message,
             status_code=status,
@@ -439,7 +455,7 @@ class Core:
             retryable=retryable,
             request_id=self._safe_token(response.headers.get("x-request-id")),
         )
-        error._inline_cap = inline_cap
+        error._multipart_cap = multipart_cap
         return error
 
     def _request(
@@ -563,15 +579,20 @@ class Core:
                     return response
                 if storage:
                     code = storage_code(response.content)
+                    eligible = (
+                        response.status_code == 403
+                        and call.grant is not None
+                        and self._wall_clock() >= call.grant.expires_at
+                    )
                     error = UploadError(
                         "Upload storage request failed",
                         status_code=response.status_code,
                         storage_code=self._safe_token(code),
-                        retryable=response.status_code in (429, 502, 503, 504),
+                        retryable=eligible or response.status_code in (429, 502, 503, 504),
                     )
                 else:
                     error = self._error(response)
-                eligible = retry_eligible(
+                eligible = eligible or retry_eligible(
                     response.status_code,
                     error.code,
                     error.retryable,
@@ -580,6 +601,13 @@ class Core:
                     explicit_guidance(error.body),
                 )
             if isinstance(error, AmbiguousSubmissionError):
+                raise error
+            # Keep the definitive refusal available even at the operation deadline.
+            if (
+                call.phase == "submit"
+                and error.status_code == 410
+                and error.code in UPLOAD_EXPIRED_CODES
+            ):
                 raise error
             call.remaining()
             if not eligible or attempt + 1 == policy.max_attempts:
@@ -642,16 +670,22 @@ class Core:
             raise UploadError("Upload replay returned a different identifier", retryable=False)
         call.upload_id = upload_id
         grant = Grant.parse(data, expected, response.status_code)
-        if call.grant is not None and grant.upload_expires_at != call.grant.upload_expires_at:
-            raise UploadError("Upload replay changed the fixed upload window", retryable=False)
+        if call.grant is not None and grant.upload_deadline != call.grant.upload_deadline:
+            raise UploadError("Upload replay changed the fixed upload deadline", retryable=False)
+        if (
+            call.grant is not None
+            and call.grant.submit_expires_at is not None
+            and grant.submit_expires_at != call.grant.submit_expires_at
+        ):
+            raise UploadError("Upload replay changed the submission deadline", retryable=False)
         call.grant = grant
-        if grant.state == "bound":
+        if grant.state == "bound" or (grant.state == "pending" and grant.put_url is None):
             self._queued(call, data.get("job_id"))
-        if grant.state in ("expired", "reclaimed"):
+        if grant.state == "expired":
             raise expired_upload()
         size = expected["size_bytes"]
         assert isinstance(size, int)
-        if grant.state == "pending" and size > grant.limits["max_upload_bytes"]:
+        if grant.put_url is not None and size > grant.limits["max_upload_bytes"]:
             raise PayloadTooLargeError("File exceeds the service upload limit", retryable=False)
 
     def _put(self, call: _Call, body: Multipart, expected: dict[str, object]) -> Flow[None]:
@@ -660,18 +694,21 @@ class Core:
             grant = call.grant
             assert grant is not None
             call.phase = "upload_put"
-            if grant.state != "pending":
+            if grant.state != "pending" or grant.put_url is None:
                 return None
-            if self._wall_clock() >= grant.upload_expires_at:
+            if self._wall_clock() > grant.upload_deadline:
                 raise expired_upload()
             if self._wall_clock() >= grant.expires_at:
                 yield from self._initialize(call, expected)
                 grant = call.grant
                 assert grant is not None
                 call.phase = "upload_put"
-                if grant.state != "pending":
+                if grant.state != "pending" or grant.put_url is None:
                     return None
-                if self._wall_clock() >= min(grant.expires_at, grant.upload_expires_at):
+                if (
+                    self._wall_clock() >= grant.expires_at
+                    or self._wall_clock() > grant.upload_deadline
+                ):
                     raise expired_upload("Upload grant has expired")
             assert grant.put_url is not None
             return (grant.put_url, grant.headers)
@@ -680,38 +717,47 @@ class Core:
             call, "PUT", "", body=UploadBody(body), storage=True, before_attempt=target
         )
 
-    def _staged(
+    def _file_upload(
         self, call: _Call, body: Multipart, fields: dict[str, str]
     ) -> Flow[Multipart | None]:
         expected = descriptor(body)
+        confirm_only = False
         try:
             yield from self._initialize(call, expected)
         except APIError as error:
-            cap = error._inline_cap
-            if (
-                cap is None
-                or call.grant is not None
-                or call.upload_id is not None
-                or len(body.prefix) + body.size + len(body.suffix) > cap
-            ):
-                raise
-            # Nothing was admitted, so the same operation key can submit the body inline.
-            inline = Multipart(
-                body.source,
-                fields,
-                body.filename,
-                call.remaining,
-                cap,
-                body.content_type,
-                body.part_headers,
-            )
-            call.read_idle = inline.read_idle
-            yield Prepare(inline, call)
-            if inline.staged or inline.sha256 != body.sha256:
-                raise IntegrityError("File content changed during the operation") from None
-            return inline
-        yield from self._put(call, body, expected)
-        for attempt in range(2):
+            if error.code in UPLOAD_EXPIRED_CODES and call.upload_id is not None:
+                # Initialization expiry cannot resolve a lost submission response.
+                confirm_only = True
+            else:
+                cap = error._multipart_cap
+                if (
+                    cap is None
+                    or call.grant is not None
+                    or call.upload_id is not None
+                    or len(body.prefix) + body.size + len(body.suffix) > cap
+                ):
+                    raise
+                # Nothing was accepted, so the same operation key can submit the body as multipart.
+                multipart = Multipart(
+                    body.source,
+                    fields,
+                    body.filename,
+                    call.remaining,
+                    cap,
+                    body.content_type,
+                    body.part_headers,
+                )
+                call.read_idle = multipart.read_idle
+                yield Prepare(multipart, call)
+                if multipart.file_upload or multipart.sha256 != body.sha256:
+                    raise IntegrityError("File content changed during the operation") from None
+                return multipart
+        upload_seconds = (
+            0.0 if confirm_only else (yield from self._finish_upload(call, body, expected))
+        )
+        replacements = 0
+        incomplete_retry = False
+        while True:
             call.phase = "submit"
             try:
                 response = yield from self._upload_json(
@@ -722,16 +768,79 @@ class Core:
                 )
             except APIError as error:
                 if (
+                    error.status_code == 410
+                    and error.code in UPLOAD_EXPIRED_CODES
+                    and call.job_id is None
+                ):
+                    # A completed expiry refusal resolves any earlier lost response.
+                    call.submission_lost = False
+                    upload_seconds = yield from self._replace_upload(
+                        call, body, expected, replacements, upload_seconds
+                    )
+                    replacements += 1
+                    incomplete_retry = False
+                    continue
+                if (
                     error.status_code != 409
-                    or error.code != _codes.upload_incomplete.code
-                    or attempt
+                    or error.code not in UPLOAD_INCOMPLETE_CODES
+                    or incomplete_retry
                 ):
                     raise
+                incomplete_retry = True
             else:
                 self._accept(call, response)
                 return None
+            upload_seconds = yield from self._finish_upload(call, body, expected, refresh=True)
+
+    def _finish_upload(
+        self, call: _Call, body: Multipart, expected: dict[str, object], *, refresh: bool = False
+    ) -> Flow[float]:
+        started = self._clock()
+        try:
+            if refresh:
+                yield from self._initialize(call, expected)
             yield from self._put(call, body, expected)
-        return None
+        except APIError as error:
+            if error.code not in UPLOAD_EXPIRED_CODES or call.upload_id is None:
+                raise
+            # Confirm acceptance with the original submission before replacing expired input.
+        return self._clock() - started
+
+    def _replace_upload(
+        self,
+        call: _Call,
+        body: Multipart,
+        expected: dict[str, object],
+        replacements: int,
+        upload_seconds: float,
+    ) -> Flow[float]:
+        advice = (
+            "Start a new call with a fresh operation key and a longer deadline "
+            "or lower upload concurrency."
+        )
+        policy = self.retry_policy
+        if replacements + 1 >= policy.max_attempts:
+            raise expired_upload("Upload expiry retry budget exhausted. " + advice, status_code=410)
+        delay = (0.75 + 0.25 * self._random()) * min(
+            policy.max_delay, policy.initial_delay * 2.0 ** min(replacements, 1023)
+        )
+        try:
+            if delay + upload_seconds >= call.remaining():
+                raise DeadlineExceededError("Insufficient time for another upload")
+            yield from self._wait(call, delay)
+            assert call.upload_id is not None
+            call.operation_key = replacement_key(call.operation_key, call.upload_id)
+            call.key_rotated = True
+            call.upload_id = None
+            call.grant = None
+            yield from self._initialize(call, expected)
+            return (yield from self._finish_upload(call, body, expected))
+        except DeadlineExceededError:
+            if call.job_id is not None:
+                raise
+            raise expired_upload(
+                "Upload expiry recovery cannot fit the operation deadline. " + advice
+            ) from None
 
     def _options(
         self, model: str, language: str | None, response_format: ResponseFormat
@@ -789,7 +898,7 @@ class Core:
         call.last_status = "queued"
         if response.status_code != 202 or call.job_id is None:
             raise invalid_response(
-                "Invalid job admission response", status_code=response.status_code
+                "Invalid job acceptance response", status_code=response.status_code
             )
         call.remaining()
 
@@ -860,7 +969,7 @@ class Core:
         language: str | None,
         response_format: ResponseFormat,
         keyed: bool,
-        force_staged: bool = False,
+        force_file_upload: bool = False,
     ) -> Flow[TranscriptionResult]:
         fields = self._options(model, language, response_format)
         content, filename, content_type, headers = unpack_file(file, filename, content_type)
@@ -872,25 +981,27 @@ class Core:
                 fields,
                 filename,
                 call.remaining,
-                self.limits.job_inline_body_bytes,
+                self.limits.job_multipart_body_bytes,
                 content_type,
                 headers,
                 lambda: setattr(call, "phase", "upload_init"),
-                force_staged,
+                force_file_upload,
             )
             call.read_idle = body.read_idle
             yield Prepare(body, call)
-            inline = (yield from self._staged(call, body, fields)) if body.staged else body
-            if inline is None:
+            multipart = (
+                (yield from self._file_upload(call, body, fields)) if body.file_upload else body
+            )
+            if multipart is None:
                 return (yield from self._poll(call, response_format))
-            size = int(inline.headers["Content-Length"])
+            size = int(multipart.headers["Content-Length"])
             asynchronous = (
                 self.transport == "job"
                 or keyed
-                or inline is not body
+                or multipart is not body
                 or size > self.limits.sync_inline_body_bytes
             )
-            body = inline
+            body = multipart
             if not asynchronous:
                 call.phase = "sync_submit"
                 refusal: APIStatusError | None = None
@@ -917,8 +1028,8 @@ class Core:
                     isinstance(refusal, PayloadTooLargeError)
                     and refusal.code in _SIZE_REFUSAL_CODES
                 )
-                unadmitted = refusal.code in SYNC_FALLBACK_CODES and refusal.retryable is True
-                if not (sized or unadmitted):
+                unaccepted = refusal.code in SYNC_FALLBACK_CODES and refusal.retryable is True
+                if not (sized or unaccepted):
                     raise refusal
             call.phase = "job_submit"
             response = yield from self._request(
@@ -964,7 +1075,7 @@ class Core:
         response_format: ResponseFormat | None,
     ) -> tuple[ResponseFormat, dict[str, Any]]:
         if job_id is None and (file is None or model is None or operation_key is None):
-            raise ValueError("Recovery before admission requires file, model and operation_key")
+            raise ValueError("Recovery before acceptance requires file, model and operation_key")
         selected: ResponseFormat = (
             response_format
             if response_format is not None
@@ -1078,5 +1189,6 @@ class Core:
             error._sync_replay = self.sync_replay == "always"
             error._caller_key = call.caller_key
             error._submission_lost = call.submission_lost
+            error._key_rotated = call.key_rotated
             error.request_id = error.request_id or call.request_id
             error._file_released = call.file_released

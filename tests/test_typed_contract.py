@@ -13,7 +13,7 @@ from support import MODEL, accepted, client, completed, error_code, recorder, re
 
 import machinera as m
 from machinera import _contract as contract
-from machinera._types import STAGED_UPLOAD_THRESHOLD_BYTES
+from machinera._types import FILE_UPLOAD_THRESHOLD_BYTES
 
 
 def test_generated_contract_digest() -> None:
@@ -22,31 +22,41 @@ def test_generated_contract_digest() -> None:
     assert header == b"# contract-sha256: " + hashlib.sha256(body).hexdigest().encode()
 
 
-def test_service_error_literals_only_appear_in_generated_contract() -> None:
+def test_service_code_branches_use_generated_sets() -> None:
     root = Path(contract.__file__).parent
     for path in root.rglob("*.py"):
         if path.name == "_contract.py":
             continue
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                assert node.value not in contract.ERROR_CODES, (path.name, node.lineno)
+        for item in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            values = []
+            if isinstance(item, ast.keyword) and item.arg == "code":
+                values.append(item.value)
+            if isinstance(item, ast.Compare) and (
+                isinstance(item.left, ast.Name)
+                and item.left.id == "code"
+                or isinstance(item.left, ast.Attribute)
+                and item.left.attr == "code"
+            ):
+                values.extend(item.comparators)
+            for value in values:
+                assert not (isinstance(value, ast.Constant) and type(value.value) is int)
 
 
 def test_contract_constants_and_static_response_formats() -> None:
     limits = m.Limits()
     assert limits.sync_inline_body_bytes == contract.DEFAULT_SYNC_CAP_BYTES
-    assert limits.job_inline_body_bytes == STAGED_UPLOAD_THRESHOLD_BYTES
-    assert STAGED_UPLOAD_THRESHOLD_BYTES <= contract.DEFAULT_INLINE_CAP_BYTES
+    assert limits.job_multipart_body_bytes == FILE_UPLOAD_THRESHOLD_BYTES
+    assert FILE_UPLOAD_THRESHOLD_BYTES <= contract.DEFAULT_MULTIPART_CAP_BYTES
     assert limits.descriptor_bytes == contract.MAX_DESCRIPTOR_BYTES
     assert m.SUPPORTED_MEDIA_SUFFIXES is contract.SUPPORTED_MEDIA_SUFFIXES
     assert set(get_args(m.ResponseFormat)) == contract.RESPONSE_FORMATS
     source = Path(contract.__file__).with_name("_types.py").read_text()
     static = next(
-        node
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.If)
-        and isinstance(node.test, ast.Name)
-        and node.test.id == "TYPE_CHECKING"
+        element
+        for element in ast.walk(ast.parse(source))
+        if isinstance(element, ast.If)
+        and isinstance(element.test, ast.Name)
+        and element.test.id == "TYPE_CHECKING"
     )
     assignment = static.body[0]
     assert isinstance(assignment, ast.Assign)
@@ -54,7 +64,7 @@ def test_contract_constants_and_static_response_formats() -> None:
     assert set(ast.literal_eval(assignment.value.slice)) == contract.RESPONSE_FORMATS
 
 
-@pytest.mark.parametrize("entry", contract.ERROR_CODES.values(), ids=lambda entry: entry.code)
+@pytest.mark.parametrize("entry", contract.ERROR_CODES.values(), ids=lambda entry: str(entry.code))
 def test_every_contract_error_maps_to_its_exception(entry: contract.ErrorCode) -> None:
     expected: type[m.APIError] = {
         400: m.BadRequestError,
@@ -68,9 +78,9 @@ def test_every_contract_error_maps_to_its_exception(entry: contract.ErrorCode) -
     }.get(entry.status, m.InternalServerError if entry.status >= 500 else m.APIStatusError)
     if entry.status == 200:
         expected = m.TerminalJobError
-    elif entry.code.startswith("upload_") and entry.status != 429:
+    elif entry.code in contract.UPLOAD_ERROR_CODES and entry.status != 429:
         expected = m.UploadError
-    if entry.code == "upload_integrity_mismatch":
+    if entry.code == 1004:
         expected = m.IntegrityError
     with client(lambda _: completed()) as sdk:
         error = sdk._error(
@@ -105,16 +115,15 @@ def test_status_heuristic_without_service_guidance(
         (body, attempts, status, operation, m.APIError)
         for body, attempts in [
             ({"error": {"code": error_code(503, False), "retryable": True}}, 2),
-            ({"error": {"code": "input_busy", "retryable": False}}, 1),
-            ({"error": {"code": "input_busy"}}, 2),
+            ({"error": {"code": 4001, "retryable": False}}, 1),
+            ({"error": {"code": 4001}}, 2),
             ({"error": {"code": error_code(503, False)}}, 1),
-            ({"error": {"code": "future_code"}}, 2),
-            ({"error": {"code": "future_code", "retryable": False}}, 1),
+            ({"error": {"code": 5999}}, 2),
+            ({"error": {"code": 5999, "retryable": False}}, 1),
             ({}, 2),
             ({"error": {}}, 2),
             ({"error": {"message": "Temporarily unavailable"}}, 2),
             ({"message": "Temporarily unavailable"}, 2),
-            ({"error": {"code": [], "retryable": None}}, 2),
             ({"error": {"retryable": "false"}}, 2),
             ({"error": {"retryable": False}}, 1),
             (None, 2),
@@ -125,21 +134,21 @@ def test_status_heuristic_without_service_guidance(
     + [
         ({"error": {"code": code, "retryable": guidance}}, 1, 400, "keyed_file", m.BadRequestError)
         for code, guidance in (
-            ("invalid_request", None),
-            ("invalid_request", False),
-            ("content_md5_mismatch", False),
+            (1019, None),
+            (1019, False),
+            (4020, False),
         )
     ]
     + [
         (
-            {"error": {"code": "temporary_refusal", "retryable": True}},
+            {"error": {"code": 4999, "retryable": True}},
             2,
             400,
             "get_job",
             m.APIError,
         ),
         (
-            {"error": {"code": "inline_completion_timeout", "retryable": True}},
+            {"error": {"code": 4003, "retryable": True}},
             1,
             504,
             "file",
@@ -202,7 +211,7 @@ def test_retry_guidance_precedence(
 def test_models_preserve_exact_body_and_projections(text: str, response_format: str) -> None:
     body = result(text)
     body["words"] = [{"word": text, "start": 0, "end": 1, "future": [None, ""]}]
-    body["warnings"] = ["", " \n ", {"code": "", "message": " \t ", "extra": [None]}]
+    body["warnings"] = [{"code": 8001, "message": " \t ", "extra": [None]}]
     body["future"] = {"nested": [None, "", " \t "]}
     model = m.TranscriptionResult.model_validate(body).model_copy(
         update={"response_format": response_format}
@@ -228,11 +237,11 @@ def test_models_preserve_exact_body_and_projections(text: str, response_format: 
         "status": "completed",
         "result": body,
         "future": "",
-        "warnings": [text],
+        "warnings": [{"code": 8001, "message": text}],
     }
     snapshot = m.JobSnapshot.model_validate(job_body)
     assert snapshot.raw == job_body and snapshot.raw["future"] == ""
-    assert snapshot.warnings == [text]
+    assert snapshot.warnings == [{"code": 8001, "message": text}]
     assert snapshot.result is not None and snapshot.result.text == text
     assert snapshot.result.raw == body
     for item, field in ((model, "text"), (snapshot, "status")):
@@ -244,7 +253,7 @@ def test_models_preserve_exact_body_and_projections(text: str, response_format: 
 
 def test_snapshot_metadata_and_typed_error() -> None:
     error = {
-        "code": "",
+        "code": 5999,
         "message": " \n ",
         "type": "",
         "retryable": False,
@@ -363,7 +372,7 @@ def test_wire_raw_extension_cannot_supply_job_fields(operation: str) -> None:
 
 def test_wire_raw_extension_cannot_populate_error_fields() -> None:
     extension = {
-        "code": "future_code",
+        "code": 5999,
         "message": "invented",
         "type": "future_type",
         "retryable": True,
@@ -401,7 +410,7 @@ MALFORMED_RESPONSES = {
     "bad_status": httpx.Response(200, json={"id": "job-1", "status": 7}),
     "wrong_id": httpx.Response(200, json={"id": "job-2", "status": "queued"}),
     "no_result": httpx.Response(200, json={"id": "job-1", "status": "completed"}),
-    "admission": httpx.Response(202, json={"status": "queued"}),
+    "acceptance": httpx.Response(202, json={"status": "queued"}),
     "sync": httpx.Response(200, json={"text": 7}),
 }
 
@@ -437,7 +446,7 @@ MALFORMED_RESPONSES = {
     + [
         pytest.param(
             "transcribe_url"
-            if kind == "admission"
+            if kind == "acceptance"
             else "transcribe_file"
             if kind == "sync"
             else "resume",

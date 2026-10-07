@@ -185,7 +185,7 @@ def test_get_job_and_resume_only_read(asynchronous: bool, text: str) -> None:
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("failure", [httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError])
-def test_lost_admission_reuses_body_and_key(failure: Any, asynchronous: bool) -> None:
+def test_lost_acceptance_reuses_body_and_key(failure: Any, asynchronous: bool) -> None:
     submissions = []
     clock = Clock()
 
@@ -206,7 +206,7 @@ def test_lost_admission_reuses_body_and_key(failure: Any, asynchronous: bool) ->
 
 
 POST_SEND = [httpx.ReadTimeout, httpx.WriteError, httpx.RemoteProtocolError]
-UNADMITTED = ["inline_claim_timeout", "inline_admission_refused", "no_serving_capacity"]
+FALLBACK_REFUSALS = [4008]
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -226,7 +226,7 @@ def test_sync_replay_deadline_is_not_ambiguous(asynchronous: bool) -> None:
 BARE_5XX = [
     lambda: httpx.Response(500),
     lambda: httpx.Response(500, text="<html>error</html>"),
-    lambda: httpx.Response(500, json={"error": {"code": "unknown_failure"}}),
+    lambda: httpx.Response(500, json={"error": {"code": 5999}}),
     lambda: httpx.Response(501, json={"error": {}}),
 ]
 
@@ -272,7 +272,7 @@ def test_retry_after_and_backoff(
         if len(requests) == 1:
             return httpx.Response(
                 status,
-                json={"error": {"code": "input_busy", "retryable": True}},
+                json={"error": {"code": 4001, "retryable": True}},
                 headers={"Retry-After": hint} if hint else {},
             )
         return accepted()
@@ -307,28 +307,28 @@ def test_retry_after_exceeds_deadline(
 @pytest.mark.parametrize(
     ("status", "code", "retryable", "kind", "transient"),
     [
-        (400, "unknown_failure", False, APIStatusError, False),
-        (401, "invalid_api_key", True, AuthenticationError, False),
-        (403, "api_key_forbidden", True, PermissionDeniedError, False),
-        (429, "clip_exceeds_tier_capacity", None, RateLimitError, False),
+        (400, 5999, False, APIStatusError, False),
+        (401, 2003, True, AuthenticationError, False),
+        (403, 2004, True, PermissionDeniedError, False),
+        (429, 3003, None, RateLimitError, False),
         (503, error_code(503, False), None, InternalServerError, False),
-        (503, "input_busy", False, InternalServerError, False),
-        (409, "idempotency_replay_unavailable", None, ConflictError, False),
-        (409, "upload_already_bound", None, UploadError, False),
-        (410, "upload_expired", None, UploadError, False),
-        (429, "upload_limit_exceeded", False, RateLimitError, False),
-        (422, "idempotency_payload_mismatch", None, UnprocessableEntityError, False),
+        (503, 4001, False, InternalServerError, False),
+        (409, 1030, None, ConflictError, False),
+        (409, 1005, None, UploadError, False),
+        (410, 1003, None, UploadError, False),
+        (429, 3001, False, RateLimitError, False),
+        (422, 1031, None, UnprocessableEntityError, False),
         (429, None, False, RateLimitError, False),
         (429, None, True, RateLimitError, True),
-        (401, "invalid_api_key", True, AuthenticationError, False),
-        (403, "api_key_forbidden", True, PermissionDeniedError, False),
+        (401, 2003, True, AuthenticationError, False),
+        (403, 2004, True, PermissionDeniedError, False),
         (503, None, True, InternalServerError, True),
         (503, None, False, InternalServerError, False),
     ],
 )
 def test_http_error_guidance_controls_retries_and_transience(
     status: int,
-    code: str | None,
+    code: int | None,
     retryable: bool | None,
     kind: Any,
     transient: bool,
@@ -393,7 +393,7 @@ def test_terminal_job_error_keeps_context(asynchronous: bool, detailed: bool) ->
                 "id": "job-1",
                 "status": "error",
                 "error": {
-                    "code": "result_unreadable",
+                    "code": 5011,
                     "retryable": False,
                     "message": "https://sensitive.example/ " + CREDENTIAL,
                 }
@@ -407,7 +407,7 @@ def test_terminal_job_error_keeps_context(asynchronous: bool, detailed: bool) ->
             sdk.resume("job-1")
     error = caught.value
     assert error.job_id == "job-1" and error.last_status == "error"
-    assert error.code == ("result_unreadable" if detailed else None)
+    assert error.code == (5011 if detailed else None)
     if detailed:
         assert error.retryable is False
     assert error.status == 200 and error.phase == "poll"
@@ -416,7 +416,7 @@ def test_terminal_job_error_keeps_context(asynchronous: bool, detailed: bool) ->
     assert "private" not in str(error)
 
 
-def test_deadline_after_admission_preserves_id() -> None:
+def test_deadline_after_acceptance_preserves_id() -> None:
     clock = Clock()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -630,9 +630,9 @@ def test_unreadable_handle_is_not_transient(asynchronous: bool) -> None:
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("code,transient", [("input_busy", True), ("service_unavailable", False)])
+@pytest.mark.parametrize("code,transient", [(4001, True), (4009, False)])
 def test_sync_phase_refusal_transience_follows_replay_safety(
-    code: str, transient: bool, asynchronous: bool
+    code: int, transient: bool, asynchronous: bool
 ) -> None:
     requests = []
 
@@ -658,7 +658,7 @@ def test_deadline_before_job_id_is_recovered_with_the_same_key(asynchronous: boo
             keys.append(request.headers["idempotency-key"])
             if lost:
                 clock.now += 6
-                raise httpx.ReadTimeout("response lost after admission")
+                raise httpx.ReadTimeout("response lost after acceptance")
             return accepted()
         return completed()
 
@@ -696,7 +696,7 @@ def test_interrupt_before_job_id_keeps_the_operation_key(asynchronous: bool, key
     assert error.is_transient is False
 
 
-def test_late_admission_response_keeps_recovery_id() -> None:
+def test_late_acceptance_response_keeps_recovery_id() -> None:
     clock = Clock()
 
     def handler(_: httpx.Request) -> httpx.Response:
@@ -714,9 +714,9 @@ def test_late_admission_response_keeps_recovery_id() -> None:
 
 @pytest.mark.parametrize("policy", ["never", "always"])
 @pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("code", UNADMITTED)
-def test_auto_sync_admission_refusal_falls_back_to_job(
-    code: str, asynchronous: bool, policy: str
+@pytest.mark.parametrize("code", FALLBACK_REFUSALS)
+def test_auto_sync_acceptance_refusal_falls_back_to_job(
+    code: int, asynchronous: bool, policy: str
 ) -> None:
     requests = []
 
@@ -727,7 +727,7 @@ def test_auto_sync_admission_refusal_falls_back_to_job(
     sync = [r for r in requests if r.url.path == "/v1/audio/transcriptions"]
     submit = [r for r in requests if r.url.path == "/v1/transcription_jobs"]
     assert output.job_id == "job-1" and len(submit) == 1
-    assert len(sync) == (1 if code == "inline_claim_timeout" else RetryPolicy().max_attempts)
+    assert len(sync) == (1 if code == 4006 else RetryPolicy().max_attempts)
     assert all(r.content == submit[0].content for r in sync)
     assert submit[0].headers["idempotency-key"]
     assert requests[-1].url.path == "/v1/transcription_jobs/job-1"
@@ -738,8 +738,8 @@ def test_auto_sync_admission_refusal_falls_back_to_job(
     ]
 
 
-@pytest.mark.parametrize("code", UNADMITTED)
-def test_job_fallback_keeps_the_call_deadline(code: str) -> None:
+@pytest.mark.parametrize("code", FALLBACK_REFUSALS)
+def test_job_fallback_keeps_the_call_deadline(code: int) -> None:
     clock = Clock()
     requests = []
 
@@ -770,12 +770,12 @@ def lost(_: httpx.Request) -> httpx.Response:
 @pytest.mark.parametrize(
     "handler,kind",
     [
-        (lambda _: refused("inline_claim_timeout", retryable=False), InternalServerError),
-        (lambda _: refused("service_unavailable"), InternalServerError),
+        (lambda _: refused(4006, retryable=False), InternalServerError),
+        (lambda _: refused(4009), InternalServerError),
         (lost, AmbiguousSubmissionError),
     ],
 )
-def test_no_job_fallback_unless_admission_refused(
+def test_no_job_fallback_unless_acceptance_refused(
     handler: Callable[[httpx.Request], httpx.Response], kind: type[Exception], asynchronous: bool
 ) -> None:
     paths = []
@@ -791,8 +791,8 @@ def test_no_job_fallback_unless_admission_refused(
     assert paths and set(paths) == {"/v1/audio/transcriptions"}
 
 
-@pytest.mark.parametrize("code", UNADMITTED)
-def test_job_transport_never_tries_sync(code: str) -> None:
+@pytest.mark.parametrize("code", FALLBACK_REFUSALS)
+def test_job_transport_never_tries_sync(code: int) -> None:
     paths = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -809,8 +809,8 @@ def test_job_transport_never_tries_sync(code: str) -> None:
     assert paths == ["/v1/transcription_jobs", "/v1/transcription_jobs/job-1"]
 
 
-@pytest.mark.parametrize("status,code", [(429, None), (503, "input_busy")])
-def test_sync_definitive_refusal_retries_same_transport(status: int, code: str | None) -> None:
+@pytest.mark.parametrize("status,code", [(429, None), (503, 4001)])
+def test_sync_definitive_refusal_retries_same_transport(status: int, code: int | None) -> None:
     requests = []
     clock = Clock()
 
@@ -1021,7 +1021,7 @@ def test_retry_and_status_logs_are_sanitized(
             if posts == 1:
                 return httpx.Response(
                     503,
-                    json={"error": {"code": "input_busy", "retryable": True}},
+                    json={"error": {"code": 4001, "retryable": True}},
                     headers={"x-request-id": "request-9"},
                 )
             return accepted()
@@ -1037,7 +1037,7 @@ def test_retry_and_status_logs_are_sanitized(
     assert retry.levelno == logging.DEBUG
     assert retry.getMessage() == (
         "Retrying POST /transcription_jobs in 0.438s after attempt 1 of 3 "
-        "(status=503, code=input_busy, request_id=request-9)"
+        "(status=503, code=4001, request_id=request-9)"
     )
     assert [(r.levelno, r.getMessage()) for r in transitions] == [
         (logging.INFO, "Job job-1 status processing"),
@@ -1134,7 +1134,7 @@ def test_text_handle_is_a_type_error(filename: str | None, text: str) -> None:
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("final", ["unsent", "refused", "rate_limited"])
+@pytest.mark.parametrize("final", ["unsent", "refused", 3999])
 def test_lost_submission_stays_non_transient_after_later_attempts(
     final: str, asynchronous: bool
 ) -> None:
@@ -1149,9 +1149,9 @@ def test_lost_submission_stays_non_transient_after_later_attempts(
             raise httpx.ReadError("response lost after send")
         if final == "unsent":
             raise httpx.ConnectError("unreachable")
-        if final == "rate_limited":
-            return httpx.Response(429, json={"error": {"code": "rate_limited"}})
-        return httpx.Response(503, json={"error": {"code": "service_unavailable"}})
+        if final == 3999:
+            return httpx.Response(429, json={"error": {"code": 3999}})
+        return httpx.Response(503, json={"error": {"code": 4009}})
 
     errors = (APIConnectionError, InternalServerError, RateLimitError)
     with client(handler, asynchronous=asynchronous) as sdk:
@@ -1191,7 +1191,7 @@ def test_keyed_deadline_before_job_id_is_transient(asynchronous: bool) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         clock.now += 6
-        raise httpx.ReadTimeout("response lost after admission")
+        raise httpx.ReadTimeout("response lost after acceptance")
 
     with client(handler, clock, asynchronous=asynchronous) as sdk:
         with pytest.raises(DeadlineExceededError) as caught:
@@ -1218,9 +1218,7 @@ def test_accepted_job_transience_follows_key_ownership(
         if failure == "deadline":
             clock.now += 3
             return queued()
-        return httpx.Response(
-            503, json={"error": {"code": "service_unavailable", "retryable": True}}
-        )
+        return httpx.Response(503, json={"error": {"code": 4009, "retryable": True}})
 
     expected = DeadlineExceededError if failure == "deadline" else InternalServerError
     with client(handler, clock, asynchronous=asynchronous) as sdk:
@@ -1237,7 +1235,7 @@ def test_accepted_job_transience_follows_key_ownership(
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_staged_resume_deadline_before_admission_is_transient(asynchronous: bool) -> None:
+def test_file_upload_resume_deadline_before_acceptance_is_transient(asynchronous: bool) -> None:
     clock = Clock()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1265,7 +1263,7 @@ def test_sync_submit_deadline_transience_follows_replay_policy(
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             503,
-            json={"error": {"code": "input_busy", "retryable": True}},
+            json={"error": {"code": 4001, "retryable": True}},
             headers={"Retry-After": "100"},
         )
 
@@ -1342,9 +1340,7 @@ REPLAY_RESPONSES = (
             id=f"permanent-{status}-{i}",
         )
         for status in (500, 503)
-        for i, error in enumerate(
-            ({"retryable": False}, {"code": "service_unavailable", "retryable": False})
-        )
+        for i, error in enumerate(({"retryable": False}, {"code": 4009, "retryable": False}))
     ]
 )
 
@@ -1433,7 +1429,7 @@ def test_submission_failure_preserves_recovery_safety(
             raise failures[failure]("submission failed")
         return unavailable()
 
-    handler = job_api(submit=reject, sync=lambda _: refused("inline_admission_refused"))
+    handler = job_api(submit=reject, sync=lambda _: refused(4008))
     with client(handler, asynchronous=asynchronous) as sdk:
         with pytest.raises(
             InternalServerError if failure == "refused" else APIConnectionError
@@ -1459,10 +1455,10 @@ def test_submission_failure_preserves_recovery_safety(
 def test_failed_job_transience_follows_recovery_entry_point(
     source: str, keyed: bool, retryable: bool, asynchronous: bool
 ) -> None:
-    code = "job_shed" if retryable else "result_unreadable"
+    code = 5006 if retryable else 5011
     handler = job_api(
         poll=lambda _: failed_job(code, retryable),
-        sync=lambda _: refused("inline_admission_refused"),
+        sync=lambda _: refused(4008),
     )
     with client(handler, asynchronous=asynchronous) as sdk:
         with pytest.raises(TerminalJobError) as caught:

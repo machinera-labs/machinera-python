@@ -33,8 +33,20 @@ lock with `uv lock`. Runtime dependency ranges live in `pyproject.toml`; the
 development lock does not constrain users. CI also installs the lowest supported
 runtime versions with pip to check those ranges independently of the lock.
 
-`src/machinera/_contract.py` is generated from the service's API contract; do not
-edit it by hand.
+`src/machinera/_contract.py` is generated from the numeric public API snapshot in
+`scripts/public_contract.json`; do not edit it by hand. Refresh that snapshot from
+the published registry, retaining only numeric descriptors and public behavior
+sets, then run `uv run python scripts/generate_contract.py`. CI checks regeneration
+and the upload fixture generated from `tests/fixtures/upload_grant_schema.json`,
+a copy of the published OpenAPI upload grant schema, including field semantics.
+Use `--snapshot <public-snapshot.json> --upload-schema <upload-schema.json>` to
+refresh both inputs; add `--check` to compare published inputs without writing.
+The generator renders `tests/fixtures/upload_grant.json` from that schema.
+Keep only public numeric descriptors, behavior sets and constants in the snapshot. CI also runs
+`uv run python scripts/check_release.py --source-only`. The copy guard
+uses fingerprinted terms in `scripts/public_terms.json` to avoid publishing the
+restricted vocabulary itself; its exact exceptions cover public wire fields and
+standard Python/HTTP library APIs.
 
 Use type hints, keep strict mypy clean, and format with Ruff (100 columns).
 Keep Python 3.10 compatibility. Add focused offline tests for behavior changes,

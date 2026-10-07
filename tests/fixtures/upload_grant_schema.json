@@ -1,0 +1,114 @@
+{
+  "type": "object",
+  "required": [
+    "upload_id",
+    "state",
+    "expires_at",
+    "upload_deadline",
+    "submit_expires_at",
+    "limits"
+  ],
+  "properties": {
+    "upload_id": {
+      "type": "string",
+      "description": "Opaque identifier scoped to this account and endpoint environment."
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "bound",
+        "expired"
+      ]
+    },
+    "put_url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Direct write capability; never log it. Present only while pending and completion has not been observed."
+    },
+    "method": {
+      "type": "string",
+      "const": "PUT"
+    },
+    "required_headers": {
+      "type": "object",
+      "required": [
+        "Content-MD5",
+        "Content-Type",
+        "Content-Length",
+        "If-None-Match"
+      ],
+      "properties": {
+        "Content-MD5": {
+          "type": "string"
+        },
+        "Content-Type": {
+          "type": "string"
+        },
+        "Content-Length": {
+          "type": "string"
+        },
+        "If-None-Match": {
+          "type": "string",
+          "const": "*"
+        }
+      }
+    },
+    "expires_at": {
+      "type": "integer",
+      "description": "PUT capability expiration in Unix seconds; plan to finish the transfer before it. Refresh a lapsed grant by replaying initialization with the same key and descriptor before starting or retrying a transfer; do not interrupt an active PUT."
+    },
+    "upload_deadline": {
+      "type": "integer",
+      "description": "Absolute submission ceiling in Unix seconds, tied to retention. Replay never extends it; this is not an estimate of transfer duration."
+    },
+    "submit_expires_at": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Inclusive submission deadline in Unix seconds, the first server observation time of the complete file plus limits.submit_grace_seconds capped by upload_deadline. Null until that observation, which submit itself records. Later inspections and retries never extend it. Submit immediately after PUT success; replaying initialization is optional."
+    },
+    "job_id": {
+      "type": "string",
+      "description": "Present after submission has been recorded."
+    },
+    "limits": {
+      "type": "object",
+      "required": [
+        "max_upload_bytes",
+        "sync_inline_body_bytes",
+        "async_inline_body_bytes",
+        "put_ttl_seconds",
+        "submit_grace_seconds",
+        "retention_max_seconds"
+      ],
+      "properties": {
+        "max_upload_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sync_inline_body_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "async_inline_body_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "put_ttl_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "submit_grace_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "retention_max_seconds": {
+          "type": "integer",
+          "description": "Maximum audio retention period in seconds. Audio may be deleted earlier after processing."
+        }
+      }
+    }
+  }
+}

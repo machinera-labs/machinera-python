@@ -27,11 +27,11 @@ class Multipart(httpx.SyncByteStream):
         max_body_bytes: int,
         content_type: str | None = None,
         part_headers: dict[str, str] | None = None,
-        on_staged: Callable[[], None] = lambda: None,
-        force_staged: bool = False,
+        on_file_upload: Callable[[], None] = lambda: None,
+        force_file_upload: bool = False,
     ) -> None:
-        self.on_staged = on_staged
-        self.staged = force_staged
+        self.on_file_upload = on_file_upload
+        self.file_upload = force_file_upload
         self.source = source
         self.fields = fields
         self.filename = filename
@@ -90,11 +90,11 @@ class Multipart(httpx.SyncByteStream):
             self._access(lambda: self.source.seek(offset))
             if self.size < 0:
                 raise ValueError("File offset is beyond the end of the file")
-            self.staged = self.staged or (
+            self.file_upload = self.file_upload or (
                 len(self.prefix) + self.size + len(self.suffix) > self.max_body_bytes
             )
-            if self.staged:
-                self.on_staged()
+            if self.file_upload:
+                self.on_file_upload()
             raw_md5 = hashlib.md5(usedforsecurity=False)
             raw_sha256 = hashlib.sha256()
             total = 0
@@ -105,13 +105,13 @@ class Multipart(httpx.SyncByteStream):
                     raise TypeError("A binary file is required")
                 if not chunk:
                     break
-                if not self.staged and marker in tail + chunk:
+                if not self.file_upload and marker in tail + chunk:
                     raise ValueError("Multipart boundary occurs in the file; start a new call")
                 tail = (tail + chunk)[-len(marker) + 1 :]
                 total += len(chunk)
                 if total > self.size:
                     raise IntegrityError("File size changed during the operation")
-                if not self.staged:
+                if not self.file_upload:
                     self.digests.append((len(chunk), hashlib.sha256(chunk).digest()))
                 raw_md5.update(chunk)
                 raw_sha256.update(chunk)

@@ -1,0 +1,619 @@
+{
+  "errors": [
+    {
+      "public_code": 1001,
+      "status": 404,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1002,
+      "status": 409,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1003,
+      "status": 410,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1004,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1005,
+      "status": 409,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1006,
+      "status": 414,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1007,
+      "status": 431,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1008,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1009,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1010,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1011,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1012,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1013,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1014,
+      "status": 413,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1015,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1016,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1017,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1018,
+      "status": 499,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1019,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1020,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1021,
+      "status": 413,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1022,
+      "status": 413,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1023,
+      "status": 411,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1024,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1025,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1026,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1027,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1028,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1029,
+      "status": 422,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1030,
+      "status": 409,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1031,
+      "status": 422,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1032,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1033,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1034,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1035,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1036,
+      "status": 404,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1037,
+      "status": 405,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1038,
+      "status": 404,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1042,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 1043,
+      "status": 409,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 2001,
+      "status": 402,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 2002,
+      "status": 402,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 2003,
+      "status": 401,
+      "type": "authentication_error",
+      "retryable": false
+    },
+    {
+      "public_code": 2004,
+      "status": 403,
+      "type": "authentication_error",
+      "retryable": false
+    },
+    {
+      "public_code": 3001,
+      "status": 429,
+      "type": "rate_limit_exceeded",
+      "retryable": true
+    },
+    {
+      "public_code": 3002,
+      "status": 429,
+      "type": "rate_limit_exceeded",
+      "retryable": false
+    },
+    {
+      "public_code": 3003,
+      "status": 429,
+      "type": "rate_limit_exceeded",
+      "retryable": false
+    },
+    {
+      "public_code": 3004,
+      "status": 429,
+      "type": "rate_limit_exceeded",
+      "retryable": true
+    },
+    {
+      "public_code": 3005,
+      "status": 429,
+      "type": "rate_limit_exceeded",
+      "retryable": true
+    },
+    {
+      "public_code": 4001,
+      "status": 503,
+      "type": "api_error",
+      "retryable": true
+    },
+    {
+      "public_code": 4002,
+      "status": 502,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 4003,
+      "status": 504,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 4004,
+      "status": 502,
+      "type": "api_error",
+      "retryable": true
+    },
+    {
+      "public_code": 4005,
+      "status": 503,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 4006,
+      "status": 503,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 4007,
+      "status": 503,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 4008,
+      "status": 503,
+      "type": "api_error",
+      "retryable": true
+    },
+    {
+      "public_code": 4009,
+      "status": 503,
+      "type": "api_error",
+      "retryable": true
+    },
+    {
+      "public_code": 4010,
+      "status": 503,
+      "type": "api_error",
+      "retryable": true
+    },
+    {
+      "public_code": 4011,
+      "status": 503,
+      "type": "api_error",
+      "retryable": true
+    },
+    {
+      "public_code": 4012,
+      "status": 502,
+      "type": "api_error",
+      "retryable": true
+    },
+    {
+      "public_code": 4013,
+      "status": 500,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 4014,
+      "status": 503,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 4015,
+      "status": 503,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 4016,
+      "status": 503,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 4017,
+      "status": 503,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 4018,
+      "status": 400,
+      "type": "api_error",
+      "retryable": true
+    },
+    {
+      "public_code": 4019,
+      "status": 408,
+      "type": "api_error",
+      "retryable": true
+    },
+    {
+      "public_code": 4020,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": false
+    },
+    {
+      "public_code": 4021,
+      "status": 400,
+      "type": "invalid_request_error",
+      "retryable": true
+    },
+    {
+      "public_code": 5001,
+      "status": 503,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 5002,
+      "status": 502,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 5003,
+      "status": 501,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 5004,
+      "status": 502,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 5005,
+      "status": 200,
+      "type": "api_error",
+      "retryable": true
+    },
+    {
+      "public_code": 5006,
+      "status": 200,
+      "type": "rate_limit_exceeded",
+      "retryable": true
+    },
+    {
+      "public_code": 5007,
+      "status": 200,
+      "type": "rate_limit_exceeded",
+      "retryable": true
+    },
+    {
+      "public_code": 5008,
+      "status": 200,
+      "type": "api_error",
+      "retryable": true
+    },
+    {
+      "public_code": 5009,
+      "status": 200,
+      "type": "api_error",
+      "retryable": true
+    },
+    {
+      "public_code": 5010,
+      "status": 200,
+      "type": "api_error",
+      "retryable": true
+    },
+    {
+      "public_code": 5011,
+      "status": 200,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 5012,
+      "status": 500,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 5013,
+      "status": 500,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 5014,
+      "status": 502,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 5015,
+      "status": 500,
+      "type": "api_error",
+      "retryable": false
+    },
+    {
+      "public_code": 5016,
+      "status": 503,
+      "type": "api_error",
+      "retryable": false
+    }
+  ],
+  "behaviors": {
+    "UPLOAD_ERROR_CODES": [
+      1001,
+      1002,
+      1003,
+      1004,
+      1005,
+      5016
+    ],
+    "UPLOAD_INTEGRITY_CODES": [
+      1004
+    ],
+    "UPLOADS_UNAVAILABLE_CODES": [
+      5001
+    ],
+    "SYNC_CAP_FALLBACK_CODES": [
+      1021,
+      1022
+    ],
+    "SYNC_FALLBACK_CODES": [
+      4008
+    ],
+    "UPLOAD_INCOMPLETE_CODES": [
+      1002
+    ],
+    "UPLOAD_EXPIRED_CODES": [
+      1003
+    ],
+    "SYNC_REPLAYABLE_CODES": [
+      4001,
+      4008,
+      4018,
+      4019,
+      4021
+    ]
+  },
+  "constants": {
+    "JOB_STATUSES": [
+      "queued",
+      "processing",
+      "completed",
+      "error"
+    ],
+    "PENDING_JOB_STATUSES": [
+      "processing",
+      "queued"
+    ],
+    "TERMINAL_JOB_STATUSES": [
+      "completed",
+      "error"
+    ],
+    "PUBLISHED_MODEL_ALIASES": [
+      "transcribe-v1"
+    ],
+    "DEFAULT_RESULT_RETENTION_S": 259200,
+    "DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S": 86400,
+    "UPLOAD_GRANT_STATES": [
+      "pending",
+      "bound",
+      "expired"
+    ],
+    "IDEMPOTENCY_KEY_HEADER": "Idempotency-Key",
+    "CONTENT_MD5_HEADER": "X-Content-MD5",
+    "RETRY_AFTER_HEADER": "Retry-After",
+    "SUPPORTED_MEDIA_SUFFIXES": [
+      "flac",
+      "m4a",
+      "mp3",
+      "mp4",
+      "mpeg",
+      "mpga",
+      "ogg",
+      "wav",
+      "webm"
+    ],
+    "RESPONSE_FORMATS": [
+      "json",
+      "text",
+      "verbose_json"
+    ],
+    "DEFERRED_RESPONSE_FORMATS": [
+      "srt",
+      "vtt"
+    ],
+    "TIMESTAMP_GRANULARITIES": [
+      "word"
+    ],
+    "DEFERRED_TIMESTAMP_GRANULARITIES": [
+      "segment"
+    ],
+    "SERVED_LANGUAGE": "en",
+    "DEFAULT_SYNC_CAP_BYTES": 26214400,
+    "MAX_DESCRIPTOR_BYTES": 65536,
+    "MAX_BATCH_SUBMISSIONS": 64,
+    "MAX_BATCH_BODY_BYTES": 4195328,
+    "MAX_BATCH_DESCRIPTOR_BYTES": 65536,
+    "MAX_BATCH_STATUSES": 300,
+    "DEFAULT_MULTIPART_CAP_BYTES": 99614720
+  }
+}

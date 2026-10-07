@@ -16,11 +16,11 @@ import pytest
 from support import API, CREDENTIAL, MODEL, WALL, Service, completed, context, result
 
 from machinera import Limits, Machinera, RetryPolicy, TranscriptionInterrupted
-from machinera._io import Cancellation, _ClaimedStream
+from machinera._io import Cancellation, _CapturedStream
 
 
 @contextmanager
-def worker(action: Callable[[], Any]) -> Iterator[list[BaseException]]:
+def thread(action: Callable[[], Any]) -> Iterator[list[BaseException]]:
     errors: list[BaseException] = []
 
     def run() -> None:
@@ -71,7 +71,7 @@ def test_cancel_wakes_poll_and_backoff(monkeypatch: pytest.MonkeyPatch, backoff:
         transport=httpx.MockTransport(handler),
         retry_policy=RetryPolicy(poll_interval=100, initial_delay=100, max_delay=100),
     ) as sdk:
-        with worker(lambda: sdk.resume("job-1")) as errors:
+        with thread(lambda: sdk.resume("job-1")) as errors:
             assert waiting.wait(1)
             start = time.monotonic()
             sdk.cancel()
@@ -88,14 +88,14 @@ def test_cancel_aborts_blocked_socket_read(before_headers: bool, reused: bool) -
     reading = threading.Event()
     finished = threading.Event()
     stream = httpcore._backends.sync.SyncStream(local)
-    network = _ClaimedStream(stream) if reused else stream
+    network = _CapturedStream(stream) if reused else stream
     calls = []
 
     class Body(httpx.SyncByteStream):
         def __iter__(self) -> Iterator[bytes]:
             try:
-                if isinstance(network, _ClaimedStream):
-                    network._claim()
+                if isinstance(network, _CapturedStream):
+                    network._capture()
                 reading.set()
                 assert network.read(1, timeout=None) == b""
                 yield b""
@@ -118,7 +118,7 @@ def test_cancel_aborts_blocked_socket_read(before_headers: bool, reused: bool) -
 
     try:
         with Machinera(api_key=CREDENTIAL, transport=Transport()) as sdk:
-            with worker(lambda: sdk.resume("job-1")) as errors:
+            with thread(lambda: sdk.resume("job-1")) as errors:
                 assert reading.wait(1)
                 sdk.cancel()
             interrupted(errors)
@@ -148,14 +148,14 @@ def test_cancel_closes_custom_response_stream() -> None:
         api_key=CREDENTIAL,
         transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=Body())),
     ) as sdk:
-        with worker(lambda: sdk.get_job("job-1")) as errors:
+        with thread(lambda: sdk.get_job("job-1")) as errors:
             assert entered.wait(1)
             sdk.cancel()
         interrupted(errors)
         assert closed.wait(1) and finished.wait(1)
 
 
-def test_cancel_mid_staged_upload_preserves_recovery() -> None:
+def test_cancel_mid_file_upload_upload_preserves_recovery() -> None:
     service = Service()
     entered, released, finished = threading.Event(), threading.Event(), threading.Event()
     partial: list[bytes] = []
@@ -198,7 +198,7 @@ def test_cancel_mid_staged_upload_preserves_recovery() -> None:
         limits=Limits(1, 2),
         wall_clock=lambda: WALL,
     ) as sdk:
-        with worker(
+        with thread(
             lambda: sdk.transcribe_file(
                 source, model=MODEL, filename="recording.wav", idempotency_key="saved-key"
             )
@@ -326,7 +326,7 @@ def test_cancel_does_not_close_borrowed_http_client_or_interrupt_other_sdk() -> 
             Machinera(api_key=CREDENTIAL, http_client=http) as other,
         ):
             try:
-                with worker(lambda: cancelled.resume("slow")) as errors:
+                with thread(lambda: cancelled.resume("slow")) as errors:
                     assert entered.wait(1)
                     cancelled.cancel()
                 interrupted(errors, "slow")
@@ -341,26 +341,26 @@ def test_cancel_does_not_close_borrowed_http_client_or_interrupt_other_sdk() -> 
 def test_cancel_during_hashing_defers_file_release() -> None:
     from support import BlockedInputAccess
 
-    probe = BlockedInputAccess("hash")
-    with Machinera(api_key=CREDENTIAL, transport=probe.transport) as sdk:
+    tracker = BlockedInputAccess("hash")
+    with Machinera(api_key=CREDENTIAL, transport=tracker.transport) as sdk:
         try:
-            with worker(
+            with thread(
                 lambda: sdk.transcribe_file(
-                    probe.source, model=MODEL, content_type="audio/wav", idempotency_key="saved"
+                    tracker.source, model=MODEL, content_type="audio/wav", idempotency_key="saved"
                 )
             ) as errors:
-                assert probe.entered.wait(1)
+                assert tracker.entered.wait(1)
                 sdk.cancel()
             error = interrupted(errors, None)
             assert not error.wait_for_file_release(0)
-            assert not probe.source.closed
-            accesses = probe.file_operations.copy()
+            assert not tracker.source.closed
+            accesses = tracker.file_operations.copy()
         finally:
-            probe.release_read.set()
+            tracker.release_read.set()
         assert error.wait_for_file_release(1)
-        assert probe.file_operations == accesses
-        assert not probe.source.closed
-        assert probe.requests == []
+        assert tracker.file_operations == accesses
+        assert not tracker.source.closed
+        assert tracker.requests == []
 
 
 def test_blocked_transport_cleanup_cannot_block_interrupted_caller() -> None:
@@ -385,7 +385,7 @@ def test_blocked_transport_cleanup_cannot_block_interrupted_caller() -> None:
 
     with Machinera(api_key=CREDENTIAL, transport=httpx.MockTransport(handler)) as sdk:
         try:
-            with worker(lambda: sdk.resume("job-1")) as errors:
+            with thread(lambda: sdk.resume("job-1")) as errors:
                 assert entered.wait(1)
                 sdk.cancel()
                 assert closing.wait(1)
@@ -462,7 +462,7 @@ def test_interrupt_chains_to_python_handler_and_restores(explicit_cancel: bool) 
 
 
 @pytest.mark.usefixtures("sigint_handler")
-def test_interrupt_chains_to_default_and_cancels_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_interrupt_chains_to_default_and_cancels_thread(monkeypatch: pytest.MonkeyPatch) -> None:
     waiting = threading.Event()
     original = Cancellation.wait
 
@@ -480,7 +480,7 @@ def test_interrupt_chains_to_default_and_cancels_worker(monkeypatch: pytest.Monk
         ),
         retry_policy=RetryPolicy(poll_interval=100),
     ) as sdk:
-        with worker(lambda: sdk.resume("job-1")) as errors:
+        with thread(lambda: sdk.resume("job-1")) as errors:
             assert waiting.wait(1)
             with pytest.raises(KeyboardInterrupt) as caught:
                 signal.raise_signal(signal.SIGINT)
@@ -492,7 +492,7 @@ def test_interrupt_chains_to_default_and_cancels_worker(monkeypatch: pytest.Monk
 
 def test_interrupt_option_refuses_construction_off_main_thread() -> None:
     previous = signal.getsignal(signal.SIGINT)
-    with worker(lambda: Machinera(api_key=CREDENTIAL, cancel_on_interrupt=True)) as errors:
+    with thread(lambda: Machinera(api_key=CREDENTIAL, cancel_on_interrupt=True)) as errors:
         pass
     assert len(errors) == 1
     assert isinstance(errors[0], ValueError)
@@ -505,7 +505,7 @@ def test_interrupt_option_requires_main_thread_close() -> None:
     previous = signal.getsignal(signal.SIGINT)
     with Machinera(api_key=CREDENTIAL, cancel_on_interrupt=True) as sdk:
         installed = signal.getsignal(signal.SIGINT)
-        with worker(sdk.close) as errors:
+        with thread(sdk.close) as errors:
             pass
         assert len(errors) == 1 and isinstance(errors[0], ValueError)
         assert not sdk._lifecycle.closed
@@ -521,7 +521,7 @@ def test_interrupt_default_leaves_handler_untouched_even_off_main_thread() -> No
         with Machinera(api_key=CREDENTIAL):
             assert signal.getsignal(signal.SIGINT) is previous
 
-    with worker(construct_and_close) as errors:
+    with thread(construct_and_close) as errors:
         pass
     assert not errors
     assert signal.getsignal(signal.SIGINT) is previous

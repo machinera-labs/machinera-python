@@ -1,0 +1,23 @@
+{
+  "upload_id": "upload-1",
+  "state": "pending",
+  "put_url": "https://storage.example/object?signature=private-signature",
+  "method": "PUT",
+  "required_headers": {
+    "Content-MD5": "uTUqbVY4eWdkTfUx8Ye9RA==",
+    "Content-Type": "audio/flac",
+    "Content-Length": "4",
+    "If-None-Match": "*"
+  },
+  "expires_at": 1700003600,
+  "upload_deadline": 1700086400,
+  "submit_expires_at": null,
+  "limits": {
+    "max_upload_bytes": 2147483648,
+    "sync_inline_body_bytes": 100,
+    "async_inline_body_bytes": 200,
+    "put_ttl_seconds": 3600,
+    "submit_grace_seconds": 300,
+    "retention_max_seconds": 172800
+  }
+}

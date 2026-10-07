@@ -1,576 +1,173 @@
 """Generated service contract; do not edit."""
-# contract-sha256: 1dd2af2e8ce2a9215cbf5012b99fb41c9be060b3fe9267d27dae2486ed39fb5c
+# contract-sha256: c5cefb4e18ffa01eb98dfa586db7cb83cda2d8208acc7e30fb8039939357e7be
 
 from collections.abc import Mapping
 from typing import NamedTuple
 
 
 class ErrorCode(NamedTuple):
-    code: str
+    code: int
     status: int
     type: str
     retryable: bool
 
 
-# Public error codes.
-ERROR_CODES: Mapping[str, ErrorCode] = {
-    "api_key_forbidden": ErrorCode(
-        code="api_key_forbidden",
-        status=403,
-        type="authentication_error",
-        retryable=False,
-    ),
-    "audio_duration_exceeded": ErrorCode(
-        code="audio_duration_exceeded",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "audio_ref_expired": ErrorCode(
-        code="audio_ref_expired",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "audio_unavailable": ErrorCode(
-        code="audio_unavailable",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "auth_rate_limited": ErrorCode(
-        code="auth_rate_limited",
-        status=429,
-        type="rate_limit_exceeded",
-        retryable=True,
-    ),
-    "batch_size_exceeded": ErrorCode(
-        code="batch_size_exceeded",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "batch_status_deferred": ErrorCode(
-        code="batch_status_deferred",
-        status=429,
-        type="rate_limit_exceeded",
-        retryable=True,
-    ),
-    "billing_blocked": ErrorCode(
-        code="billing_blocked",
-        status=402,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "broker_capacity_exhausted": ErrorCode(
-        code="broker_capacity_exhausted",
-        status=503,
-        type="api_error",
-        retryable=True,
-    ),
-    "clip_exceeds_tier_capacity": ErrorCode(
-        code="clip_exceeds_tier_capacity",
-        status=429,
-        type="rate_limit_exceeded",
-        retryable=False,
-    ),
-    "config_missing": ErrorCode(
-        code="config_missing",
-        status=500,
-        type="api_error",
-        retryable=True,
-    ),
-    "content_md5_mismatch": ErrorCode(
-        code="content_md5_mismatch",
-        status=400,
-        type="invalid_request_error",
-        retryable=True,
-    ),
-    "duration_exceeds_declared": ErrorCode(
-        code="duration_exceeds_declared",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "fusion_failed": ErrorCode(
-        code="fusion_failed",
-        status=502,
-        type="api_error",
-        retryable=True,
-    ),
-    "idempotency_payload_mismatch": ErrorCode(
-        code="idempotency_payload_mismatch",
-        status=422,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "idempotency_replay_unavailable": ErrorCode(
-        code="idempotency_replay_unavailable",
-        status=409,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "incomplete_body": ErrorCode(
-        code="incomplete_body",
-        status=400,
-        type="api_error",
-        retryable=True,
-    ),
-    "incomplete_upload": ErrorCode(
-        code="incomplete_upload",
-        status=400,
-        type="invalid_request_error",
-        retryable=True,
-    ),
-    "inline_admission_refused": ErrorCode(
-        code="inline_admission_refused",
-        status=503,
-        type="api_error",
-        retryable=True,
-    ),
-    "inline_body_over_cap": ErrorCode(
-        code="inline_body_over_cap",
-        status=413,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "inline_claim_timeout": ErrorCode(
-        code="inline_claim_timeout",
-        status=503,
-        type="api_error",
-        retryable=True,
-    ),
-    "inline_completion_timeout": ErrorCode(
-        code="inline_completion_timeout",
-        status=504,
-        type="api_error",
-        retryable=True,
-    ),
-    "inline_dispatch_invalid": ErrorCode(
-        code="inline_dispatch_invalid",
-        status=502,
-        type="api_error",
-        retryable=True,
-    ),
-    "inline_lifecycle_unavailable": ErrorCode(
-        code="inline_lifecycle_unavailable",
-        status=503,
-        type="api_error",
-        retryable=True,
-    ),
-    "inline_transfer_failed": ErrorCode(
-        code="inline_transfer_failed",
-        status=502,
-        type="api_error",
-        retryable=True,
-    ),
-    "input_busy": ErrorCode(
-        code="input_busy",
-        status=503,
-        type="api_error",
-        retryable=True,
-    ),
-    "insufficient_balance": ErrorCode(
-        code="insufficient_balance",
-        status=402,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "invalid_api_key": ErrorCode(
-        code="invalid_api_key",
-        status=401,
-        type="authentication_error",
-        retryable=False,
-    ),
-    "invalid_duration_declaration": ErrorCode(
-        code="invalid_duration_declaration",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "invalid_request": ErrorCode(
-        code="invalid_request",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "job_attempts_exhausted": ErrorCode(
-        code="job_attempts_exhausted",
-        status=200,
-        type="api_error",
-        retryable=True,
-    ),
-    "job_not_found": ErrorCode(
-        code="job_not_found",
-        status=404,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "job_placement_lost": ErrorCode(
-        code="job_placement_lost",
-        status=200,
-        type="api_error",
-        retryable=True,
-    ),
-    "job_queue_timed_out": ErrorCode(
-        code="job_queue_timed_out",
-        status=200,
-        type="rate_limit_exceeded",
-        retryable=True,
-    ),
-    "job_shed": ErrorCode(
-        code="job_shed",
-        status=200,
-        type="rate_limit_exceeded",
-        retryable=True,
-    ),
-    "job_tombstoned": ErrorCode(
-        code="job_tombstoned",
-        status=200,
-        type="api_error",
-        retryable=True,
-    ),
-    "jobs_store_unconfigured": ErrorCode(
-        code="jobs_store_unconfigured",
-        status=503,
-        type="api_error",
-        retryable=True,
-    ),
-    "length_required": ErrorCode(
-        code="length_required",
-        status=411,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "media_unprobeable": ErrorCode(
-        code="media_unprobeable",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "method_not_allowed": ErrorCode(
-        code="method_not_allowed",
-        status=405,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "mock_box_unconfigured": ErrorCode(
-        code="mock_box_unconfigured",
-        status=503,
-        type="api_error",
-        retryable=True,
-    ),
-    "model_required": ErrorCode(
-        code="model_required",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "no_serving_capacity": ErrorCode(
-        code="no_serving_capacity",
-        status=503,
-        type="api_error",
-        retryable=True,
-    ),
-    "non_english_audio": ErrorCode(
-        code="non_english_audio",
-        status=422,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "origin_invalid": ErrorCode(
-        code="origin_invalid",
-        status=503,
-        type="api_error",
-        retryable=True,
-    ),
-    "origin_not_configured": ErrorCode(
-        code="origin_not_configured",
-        status=503,
-        type="api_error",
-        retryable=True,
-    ),
-    "payload_too_large": ErrorCode(
-        code="payload_too_large",
-        status=413,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "queue_operation_rejected": ErrorCode(
-        code="queue_operation_rejected",
-        status=502,
-        type="api_error",
-        retryable=False,
-    ),
-    "request_aborted": ErrorCode(
-        code="request_aborted",
-        status=499,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "request_body_timeout": ErrorCode(
-        code="request_body_timeout",
-        status=408,
-        type="api_error",
-        retryable=True,
-    ),
-    "request_headers_too_large": ErrorCode(
-        code="request_headers_too_large",
-        status=431,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "request_path_too_long": ErrorCode(
-        code="request_path_too_long",
-        status=414,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "result_unavailable": ErrorCode(
-        code="result_unavailable",
-        status=200,
-        type="api_error",
-        retryable=True,
-    ),
-    "result_unreadable": ErrorCode(
-        code="result_unreadable",
-        status=200,
-        type="api_error",
-        retryable=False,
-    ),
-    "service_unavailable": ErrorCode(
-        code="service_unavailable",
-        status=503,
-        type="api_error",
-        retryable=True,
-    ),
-    "shared_queue_unavailable": ErrorCode(
-        code="shared_queue_unavailable",
-        status=503,
-        type="api_error",
-        retryable=True,
-    ),
-    "staged_uploads_unavailable": ErrorCode(
-        code="staged_uploads_unavailable",
-        status=503,
-        type="api_error",
-        retryable=False,
-    ),
-    "strong_pubkey_invalid": ErrorCode(
-        code="strong_pubkey_invalid",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "strong_pubkey_missing": ErrorCode(
-        code="strong_pubkey_missing",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "sub_ensemble_floor": ErrorCode(
-        code="sub_ensemble_floor",
-        status=502,
-        type="api_error",
-        retryable=False,
-    ),
-    "sync_size_cap": ErrorCode(
-        code="sync_size_cap",
-        status=413,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "unknown_model": ErrorCode(
-        code="unknown_model",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "unknown_url": ErrorCode(
-        code="unknown_url",
-        status=404,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "unsupported_granularity": ErrorCode(
-        code="unsupported_granularity",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "unsupported_language": ErrorCode(
-        code="unsupported_language",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "unsupported_media_type": ErrorCode(
-        code="unsupported_media_type",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "unsupported_response_format": ErrorCode(
-        code="unsupported_response_format",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "unsupported_scheme": ErrorCode(
-        code="unsupported_scheme",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "upload_already_bound": ErrorCode(
-        code="upload_already_bound",
-        status=409,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "upload_expired": ErrorCode(
-        code="upload_expired",
-        status=410,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "upload_incomplete": ErrorCode(
-        code="upload_incomplete",
-        status=409,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "upload_integrity_mismatch": ErrorCode(
-        code="upload_integrity_mismatch",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "upload_limit_exceeded": ErrorCode(
-        code="upload_limit_exceeded",
-        status=429,
-        type="rate_limit_exceeded",
-        retryable=True,
-    ),
-    "upload_not_found": ErrorCode(
-        code="upload_not_found",
-        status=404,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "url_blocked": ErrorCode(
-        code="url_blocked",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "url_fetch_unconfigured": ErrorCode(
-        code="url_fetch_unconfigured",
-        status=501,
-        type="api_error",
-        retryable=False,
-    ),
-    "url_unreachable": ErrorCode(
-        code="url_unreachable",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
-    "webhook_blocked": ErrorCode(
-        code="webhook_blocked",
-        status=400,
-        type="invalid_request_error",
-        retryable=False,
-    ),
+ERROR_CODES: Mapping[int, ErrorCode] = {
+    1001: ErrorCode(1001, 404, "invalid_request_error", False),
+    1002: ErrorCode(1002, 409, "invalid_request_error", False),
+    1003: ErrorCode(1003, 410, "invalid_request_error", False),
+    1004: ErrorCode(1004, 400, "invalid_request_error", False),
+    1005: ErrorCode(1005, 409, "invalid_request_error", False),
+    1006: ErrorCode(1006, 414, "invalid_request_error", False),
+    1007: ErrorCode(1007, 431, "invalid_request_error", False),
+    1008: ErrorCode(1008, 400, "invalid_request_error", False),
+    1009: ErrorCode(1009, 400, "invalid_request_error", False),
+    1010: ErrorCode(1010, 400, "invalid_request_error", False),
+    1011: ErrorCode(1011, 400, "invalid_request_error", False),
+    1012: ErrorCode(1012, 400, "invalid_request_error", False),
+    1013: ErrorCode(1013, 400, "invalid_request_error", False),
+    1014: ErrorCode(1014, 413, "invalid_request_error", False),
+    1015: ErrorCode(1015, 400, "invalid_request_error", False),
+    1016: ErrorCode(1016, 400, "invalid_request_error", False),
+    1017: ErrorCode(1017, 400, "invalid_request_error", False),
+    1018: ErrorCode(1018, 499, "invalid_request_error", False),
+    1019: ErrorCode(1019, 400, "invalid_request_error", False),
+    1020: ErrorCode(1020, 400, "invalid_request_error", False),
+    1021: ErrorCode(1021, 413, "invalid_request_error", False),
+    1022: ErrorCode(1022, 413, "invalid_request_error", False),
+    1023: ErrorCode(1023, 411, "invalid_request_error", False),
+    1024: ErrorCode(1024, 400, "invalid_request_error", False),
+    1025: ErrorCode(1025, 400, "invalid_request_error", False),
+    1026: ErrorCode(1026, 400, "invalid_request_error", False),
+    1027: ErrorCode(1027, 400, "invalid_request_error", False),
+    1028: ErrorCode(1028, 400, "invalid_request_error", False),
+    1029: ErrorCode(1029, 422, "invalid_request_error", False),
+    1030: ErrorCode(1030, 409, "invalid_request_error", False),
+    1031: ErrorCode(1031, 422, "invalid_request_error", False),
+    1032: ErrorCode(1032, 400, "invalid_request_error", False),
+    1033: ErrorCode(1033, 400, "invalid_request_error", False),
+    1034: ErrorCode(1034, 400, "invalid_request_error", False),
+    1035: ErrorCode(1035, 400, "invalid_request_error", False),
+    1036: ErrorCode(1036, 404, "invalid_request_error", False),
+    1037: ErrorCode(1037, 405, "invalid_request_error", False),
+    1038: ErrorCode(1038, 404, "invalid_request_error", False),
+    1042: ErrorCode(1042, 400, "invalid_request_error", False),
+    1043: ErrorCode(1043, 409, "api_error", False),
+    2001: ErrorCode(2001, 402, "invalid_request_error", False),
+    2002: ErrorCode(2002, 402, "invalid_request_error", False),
+    2003: ErrorCode(2003, 401, "authentication_error", False),
+    2004: ErrorCode(2004, 403, "authentication_error", False),
+    3001: ErrorCode(3001, 429, "rate_limit_exceeded", True),
+    3002: ErrorCode(3002, 429, "rate_limit_exceeded", False),
+    3003: ErrorCode(3003, 429, "rate_limit_exceeded", False),
+    3004: ErrorCode(3004, 429, "rate_limit_exceeded", True),
+    3005: ErrorCode(3005, 429, "rate_limit_exceeded", True),
+    4001: ErrorCode(4001, 503, "api_error", True),
+    4002: ErrorCode(4002, 502, "api_error", False),
+    4003: ErrorCode(4003, 504, "api_error", False),
+    4004: ErrorCode(4004, 502, "api_error", True),
+    4005: ErrorCode(4005, 503, "api_error", False),
+    4006: ErrorCode(4006, 503, "api_error", False),
+    4007: ErrorCode(4007, 503, "api_error", False),
+    4008: ErrorCode(4008, 503, "api_error", True),
+    4009: ErrorCode(4009, 503, "api_error", True),
+    4010: ErrorCode(4010, 503, "api_error", True),
+    4011: ErrorCode(4011, 503, "api_error", True),
+    4012: ErrorCode(4012, 502, "api_error", True),
+    4013: ErrorCode(4013, 500, "api_error", False),
+    4014: ErrorCode(4014, 503, "api_error", False),
+    4015: ErrorCode(4015, 503, "api_error", False),
+    4016: ErrorCode(4016, 503, "api_error", False),
+    4017: ErrorCode(4017, 503, "api_error", False),
+    4018: ErrorCode(4018, 400, "api_error", True),
+    4019: ErrorCode(4019, 408, "api_error", True),
+    4020: ErrorCode(4020, 400, "invalid_request_error", False),
+    4021: ErrorCode(4021, 400, "invalid_request_error", True),
+    5001: ErrorCode(5001, 503, "api_error", False),
+    5002: ErrorCode(5002, 502, "api_error", False),
+    5003: ErrorCode(5003, 501, "api_error", False),
+    5004: ErrorCode(5004, 502, "api_error", False),
+    5005: ErrorCode(5005, 200, "api_error", True),
+    5006: ErrorCode(5006, 200, "rate_limit_exceeded", True),
+    5007: ErrorCode(5007, 200, "rate_limit_exceeded", True),
+    5008: ErrorCode(5008, 200, "api_error", True),
+    5009: ErrorCode(5009, 200, "api_error", True),
+    5010: ErrorCode(5010, 200, "api_error", True),
+    5011: ErrorCode(5011, 200, "api_error", False),
+    5012: ErrorCode(5012, 500, "api_error", False),
+    5013: ErrorCode(5013, 500, "api_error", False),
+    5014: ErrorCode(5014, 502, "api_error", False),
+    5015: ErrorCode(5015, 500, "api_error", False),
+    5016: ErrorCode(5016, 503, "api_error", False),
 }
 
-# Retryable public error codes.
-RETRYABLE_CODES: frozenset[str] = frozenset(
+RETRYABLE_CODES: frozenset[int] = frozenset(
     code for code, entry in ERROR_CODES.items() if entry.retryable
 )
-
-# Terminal public error codes.
-TERMINAL_CODES: frozenset[str] = frozenset(
+TERMINAL_CODES: frozenset[int] = frozenset(
     code for code, entry in ERROR_CODES.items() if not entry.retryable
 )
 
-# Public job statuses.
+UPLOAD_ERROR_CODES: frozenset[int] = frozenset({1001, 1002, 1003, 1004, 1005, 5016})
+
+UPLOAD_INTEGRITY_CODES: frozenset[int] = frozenset({1004})
+
+UPLOADS_UNAVAILABLE_CODES: frozenset[int] = frozenset({5001})
+
+SYNC_CAP_FALLBACK_CODES: frozenset[int] = frozenset({1021, 1022})
+
+SYNC_FALLBACK_CODES: frozenset[int] = frozenset({4008})
+
+UPLOAD_INCOMPLETE_CODES: frozenset[int] = frozenset({1002})
+
+UPLOAD_EXPIRED_CODES: frozenset[int] = frozenset({1003})
+
+SYNC_REPLAYABLE_CODES: frozenset[int] = frozenset({4001, 4008, 4018, 4019, 4021})
+
 JOB_STATUSES: tuple[str, ...] = ("queued", "processing", "completed", "error")
 
-# Pending job statuses.
 PENDING_JOB_STATUSES: frozenset[str] = frozenset({"processing", "queued"})
 
-# Terminal job statuses.
 TERMINAL_JOB_STATUSES: frozenset[str] = frozenset({"completed", "error"})
 
-# Published model aliases.
 PUBLISHED_MODEL_ALIASES: tuple[str, ...] = ("transcribe-v1",)
 
-# Default result retention in seconds; guaranteed minimum, may lengthen but never shorten.
 DEFAULT_RESULT_RETENTION_S: int = 259200
 
-# Default idempotency replay window in seconds; guaranteed minimum, may lengthen but never shorten.
 DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S: int = 86400
 
-# Upload grant states.
-UPLOAD_GRANT_STATES: tuple[str, ...] = ("pending", "admitting", "bound", "expired", "reclaimed")
+UPLOAD_GRANT_STATES: tuple[str, ...] = ("pending", "bound", "expired")
 
-# Idempotency key header.
 IDEMPOTENCY_KEY_HEADER: str = "Idempotency-Key"
 
-# Request content checksum header.
 CONTENT_MD5_HEADER: str = "X-Content-MD5"
 
-# Retry delay header.
 RETRY_AFTER_HEADER: str = "Retry-After"
 
-# Accepted media suffixes.
 SUPPORTED_MEDIA_SUFFIXES: frozenset[str] = frozenset(
-    {
-        "flac",
-        "m4a",
-        "mp3",
-        "mp4",
-        "mpeg",
-        "mpga",
-        "ogg",
-        "wav",
-        "webm",
-    }
+    {"flac", "m4a", "mp3", "mp4", "mpeg", "mpga", "ogg", "wav", "webm"}
 )
 
-# Served response formats.
 RESPONSE_FORMATS: frozenset[str] = frozenset({"json", "text", "verbose_json"})
 
-# Deferred response formats.
 DEFERRED_RESPONSE_FORMATS: frozenset[str] = frozenset({"srt", "vtt"})
 
-# Served timestamp granularities.
 TIMESTAMP_GRANULARITIES: frozenset[str] = frozenset({"word"})
 
-# Deferred timestamp granularities.
 DEFERRED_TIMESTAMP_GRANULARITIES: frozenset[str] = frozenset({"segment"})
 
-# Served language.
 SERVED_LANGUAGE: str = "en"
 
-# Synchronous multipart byte cap.
 DEFAULT_SYNC_CAP_BYTES: int = 26214400
 
-# Inline job body byte cap.
-DEFAULT_INLINE_CAP_BYTES: int = 99614720
-
-# Job descriptor byte cap.
 MAX_DESCRIPTOR_BYTES: int = 65536
 
-# Batch submission count cap.
 MAX_BATCH_SUBMISSIONS: int = 64
 
-# Batch request body byte cap.
 MAX_BATCH_BODY_BYTES: int = 4195328
 
-# Batch item descriptor byte cap.
 MAX_BATCH_DESCRIPTOR_BYTES: int = 65536
 
-# Batch status count cap.
 MAX_BATCH_STATUSES: int = 300
+
+DEFAULT_MULTIPART_CAP_BYTES: int = 99614720

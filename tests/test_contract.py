@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import builtins
 import hashlib
 import importlib.util
@@ -25,7 +24,6 @@ from support import (
 )
 
 import machinera as m
-from machinera import _codes
 
 
 @pytest.mark.parametrize(
@@ -291,7 +289,7 @@ STATUS_ERRORS = [
 @pytest.mark.parametrize("status,kind", STATUS_ERRORS)
 def test_status_errors_and_safe_body(status: int, kind: type[m.APIStatusError]) -> None:
     detail = {
-        "code": "test_code",
+        "code": 5998,
         "retryable": False,
         "job_id": "job-1",
         "upload_id": "https://secret.example/a",
@@ -308,7 +306,7 @@ def test_status_errors_and_safe_body(status: int, kind: type[m.APIStatusError]) 
     error = caught.value
     assert type(error) is kind and error.status_code == error.status == status
     assert str(error) == error.message + " (request_id: request-1)" and error.retryable is False
-    assert error.body == {"code": "test_code", "retryable": False, "job_id": "job-1"}
+    assert error.body == {"code": 5998, "retryable": False, "job_id": "job-1"}
     assert error.request_id == "request-1" and error.job_id == "job-1"
     assert error.__context__ is error.__cause__ is None
     assert not hasattr(error, "request") and not hasattr(error, "response")
@@ -346,7 +344,7 @@ def owned(
             m.InternalServerError(
                 "x",
                 status_code=503,
-                code="no_serving_capacity",
+                code=4008,
                 retryable=True,
                 phase="sync_submit",
             ),
@@ -354,7 +352,7 @@ def owned(
         ),
         (
             m.InternalServerError(
-                "x", status_code=503, code="input_busy", retryable=True, phase="sync_submit"
+                "x", status_code=503, code=4001, retryable=True, phase="sync_submit"
             ),
             True,
         ),
@@ -362,7 +360,7 @@ def owned(
             m.InternalServerError(
                 "x",
                 status_code=503,
-                code="no_serving_capacity",
+                code=4008,
                 retryable=False,
                 phase="sync_submit",
             ),
@@ -407,14 +405,14 @@ def owned(
                 m.InternalServerError(
                     "x",
                     status_code=503,
-                    code="inline_claim_timeout",
+                    code=4008,
                     retryable=True,
                     phase="sync_submit",
                 ),
                 False,
                 replay=True,
             ),
-            False,
+            True,
         ),
     ],
 )
@@ -511,17 +509,17 @@ def test_exported_error_hierarchy_and_attributes(
     error = kind(
         "safe",
         status_code=409,
-        code="test",
+        code=5999,
         request_id="r",
         job_id="j",
         upload_id="u",
         operation_key="k",
         phase="poll",
         last_status="queued",
-        body={"code": "test"},
+        body={"code": 5999},
         retryable=True,
     )
-    assert (error.status_code, error.request_id, error.code) == (409, "r", "test")
+    assert (error.status_code, error.request_id, error.code) == (409, "r", 5999)
     assert (error.job_id, error.upload_id, error.operation_key) == ("j", "u", "k")
     assert (error.phase, error.last_status, error.message) == ("poll", "queued", "safe")
     assert error.retryable is (kind not in (m.DeadlineExceededError, m.AmbiguousSubmissionError))
@@ -842,17 +840,6 @@ def test_unsupported_explicit_names_never_fall_back(
                 filename=name if form == "keyword" else None,
                 content_type=content_type,
             )
-
-
-def test_every_referenced_error_code_exists() -> None:
-    for path in Path(m.__file__).parent.glob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text())):
-            if (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id == "_codes"
-            ):
-                assert hasattr(_codes, node.attr), f"{path.name}:{node.lineno}: {node.attr}"
 
 
 def test_unrecognized_content_type_is_rejected_only_for_unnamed_input() -> None:

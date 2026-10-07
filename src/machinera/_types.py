@@ -10,6 +10,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    StrictInt,
     StrictStr,
     TypeAdapter,
     field_validator,
@@ -101,9 +102,10 @@ class RetryPolicy:
     max_attempts includes the initial request. Exponential backoff starts at
     initial_delay and is capped by max_delay before uniform jitter in [0.75, 1].
 
-    Retry-After is a minimum. poll_interval sets normal polling cadence; polling ends
-    at the call's deadline, and max_polls, when set, is an additional hard cap on the
-    number of status reads. HTTP transport retries use the default of zero:
+    Positive Retry-After is a minimum; zero leaves bounded backoff in effect.
+    poll_interval sets normal polling cadence; polling ends at the call's deadline.
+    max_polls, when set, is an additional hard cap on the number of status reads.
+    HTTP transport retries use the default of zero:
     https://www.python-httpx.org/advanced/transports/
     """
 
@@ -124,8 +126,8 @@ class RetryPolicy:
             raise ValueError("max_polls must be None or a positive integer")
 
 
-STAGED_UPLOAD_THRESHOLD_BYTES = 50 * 1024 * 1024
-"""SDK selection point for staged uploads; the service inline cap is DEFAULT_INLINE_CAP_BYTES."""
+FILE_UPLOAD_THRESHOLD_BYTES = 50 * 1024 * 1024
+"""SDK selection point for file uploads, below the service multipart cap."""
 
 
 @dataclass(frozen=True)
@@ -133,15 +135,15 @@ class Limits:
     """Encoded request-size limits in bytes; field declarations set defaults."""
 
     sync_inline_body_bytes: int = DEFAULT_SYNC_CAP_BYTES
-    job_inline_body_bytes: int = STAGED_UPLOAD_THRESHOLD_BYTES
+    job_multipart_body_bytes: int = FILE_UPLOAD_THRESHOLD_BYTES
     descriptor_bytes: int = MAX_DESCRIPTOR_BYTES
 
     def __post_init__(self) -> None:
-        for name in ("sync_inline_body_bytes", "job_inline_body_bytes", "descriptor_bytes"):
+        for name in ("sync_inline_body_bytes", "job_multipart_body_bytes", "descriptor_bytes"):
             value = getattr(self, name)
             if not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        if self.sync_inline_body_bytes > self.job_inline_body_bytes:
+        if self.sync_inline_body_bytes > self.job_multipart_body_bytes:
             raise ValueError("sync limit must not exceed job limit")
 
 
@@ -178,11 +180,11 @@ class TranscriptionWord(_ResponseModel):
 class _Warning(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    code: StrictStr | None = None
+    code: StrictInt
     message: StrictStr | None = None
 
 
-_WARNINGS = TypeAdapter(list[StrictStr | _Warning])
+_WARNINGS = TypeAdapter(list[_Warning])
 
 
 class _WarningsModel(_ResponseModel):
@@ -234,7 +236,7 @@ class TranscriptionResult(_WarningsModel):
 class JobError(_ResponseModel):
     """Error metadata returned in a job snapshot."""
 
-    code: StrictStr | None = None
+    code: StrictInt | None = None
     message: StrictStr | None = Field(default=None, repr=False)
     type: StrictStr | None = None
     retryable: bool | None = None

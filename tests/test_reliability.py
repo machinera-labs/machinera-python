@@ -42,7 +42,7 @@ from machinera import (
     RetryPolicy,
     TimeoutPolicy,
 )
-from machinera._io import _ClaimedStream, _ClaimingBackend, _driver
+from machinera._io import _CapturedStream, _CapturingBackend, _driver
 
 
 @pytest.mark.parametrize("keyed", [False, True])
@@ -50,14 +50,13 @@ from machinera._io import _ClaimedStream, _ClaimingBackend, _driver
 @pytest.mark.parametrize(
     "code,status",
     [
-        ("content_md5_mismatch", 400),
-        ("incomplete_body", 400),
-        ("incomplete_upload", 400),
-        ("request_body_timeout", 408),
+        (4018, 400),
+        (4021, 400),
+        (4019, 408),
     ],
 )
 def test_retryable_refusals_replay_exact_bytes(
-    keyed: bool, guidance: bool | None, code: str, status: int
+    keyed: bool, guidance: bool | None, code: int, status: int
 ) -> None:
     clock = Clock()
     submissions = []
@@ -93,15 +92,13 @@ def test_retryable_refusals_replay_exact_bytes(
 
 
 @pytest.mark.parametrize("deadline", [None, 1])
-def test_integrity_refusal_obeys_attempt_and_deadline_bounds(deadline: int | None) -> None:
+def test_transfer_refusal_obeys_attempt_and_deadline_bounds(deadline: int | None) -> None:
     requests = []
     clock = Clock()
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(
-            400, json={"error": {"code": "content_md5_mismatch"}}, headers={"Retry-After": "2"}
-        )
+        return httpx.Response(400, json={"error": {"code": 4018}}, headers={"Retry-After": "2"})
 
     with client(handler, clock, retry_policy=RetryPolicy(max_attempts=2)) as sdk:
         with pytest.raises(BadRequestError if deadline is None else DeadlineExceededError):
@@ -368,60 +365,60 @@ def test_cancelled_exchange_does_not_change_a_later_call() -> None:
 def test_deadline_during_input_access_releases_caller_before_input(
     monkeypatch: Any, owned: bool, blocked_phase: str
 ) -> None:
-    probe = BlockedInputAccess(blocked_phase)
+    tracker = BlockedInputAccess(blocked_phase)
     if owned:
-        monkeypatch.setattr("machinera._files.open", lambda *args: probe.source, raising=False)
+        monkeypatch.setattr("machinera._files.open", lambda *args: tracker.source, raising=False)
     # A frozen operation clock gives every bounded phase the full deadline, so the
     # phases before the blocked one cannot spend it on a slow runner and expire the
     # call before the blocking access is reached; only the blocked phase's own
     # real-time watchdog can fire.
-    sdk = Machinera(api_key=CREDENTIAL, base_url=API, transport=probe.transport, clock=Clock())
+    sdk = Machinera(api_key=CREDENTIAL, base_url=API, transport=tracker.transport, clock=Clock())
     try:
         with sdk:
             with pytest.raises(DeadlineExceededError) as caught:
                 sdk.transcribe_file(
-                    "recording.wav" if owned else probe.source,
+                    "recording.wav" if owned else tracker.source,
                     model=MODEL,
                     idempotency_key="saved",
                     deadline=0.3,
                     content_type="audio/wav",
                 )
-            assert probe.entered.is_set() and not probe.release_read.is_set()
-            assert time.monotonic() - probe.entered_at[0] < 0.75
-            assert probe.source.reads == probe.expected_reads and not probe.source.closed
+            assert tracker.entered.is_set() and not tracker.release_read.is_set()
+            assert time.monotonic() - tracker.entered_at[0] < 0.75
+            assert tracker.source.reads == tracker.expected_reads and not tracker.source.closed
             assert not caught.value.wait_for_file_release(0)
             if blocked_phase == "upload":
-                assert probe.connection_closed.wait(0.5)
+                assert tracker.connection_closed.wait(0.5)
             else:
-                assert probe.requests == [] and not probe.connection_closed.is_set()
+                assert tracker.requests == [] and not tracker.connection_closed.is_set()
                 assert caught.value.phase == "prepare"
             if not owned:
                 with pytest.raises(ValueError, match="simultaneous"):
-                    sdk.transcribe_file(probe.source, model=MODEL, content_type="audio/wav")
-            operations_at_abort = probe.file_operations.copy()
-        assert time.monotonic() - probe.entered_at[0] < 0.85
-        assert not probe.client_closed.is_set() and not probe.source.closed
-        probe.release_read.set()
+                    sdk.transcribe_file(tracker.source, model=MODEL, content_type="audio/wav")
+            operations_at_abort = tracker.file_operations.copy()
+        assert time.monotonic() - tracker.entered_at[0] < 0.85
+        assert not tracker.client_closed.is_set() and not tracker.source.closed
+        tracker.release_read.set()
         assert caught.value.wait_for_file_release(1)
-        assert probe.client_closed.wait(1)
+        assert tracker.client_closed.wait(1)
         if blocked_phase == "upload":
-            assert probe.exchange_finished.wait(1)
+            assert tracker.exchange_finished.wait(1)
         else:
-            assert probe.requests == [] and not probe.exchange_finished.is_set()
-        assert probe.file_operations == operations_at_abort
-        assert probe.source.reads == probe.expected_reads
-        assert probe.source.closed is owned
+            assert tracker.requests == [] and not tracker.exchange_finished.is_set()
+        assert tracker.file_operations == operations_at_abort
+        assert tracker.source.reads == tracker.expected_reads
+        assert tracker.source.closed is owned
         if not owned:
-            probe.source.seek(0)
-            assert probe.source.read() == b"audio"
-            probe.source.close()
+            tracker.source.seek(0)
+            assert tracker.source.read() == b"audio"
+            tracker.source.close()
     finally:
-        probe.release_read.set()
+        tracker.release_read.set()
         sdk.close()
 
 
 def test_file_release_check_is_immediate_without_a_pending_read() -> None:
-    with client(lambda _: httpx.Response(400, json={"error": {"code": "invalid_request"}})) as sdk:
+    with client(lambda _: httpx.Response(400, json={"error": {"code": 1019}})) as sdk:
         with pytest.raises(BadRequestError) as caught:
             sdk.transcribe_file(io.BytesIO(b"audio"), model=MODEL, content_type="audio/wav")
     assert caught.value.wait_for_file_release(0)
@@ -596,15 +593,15 @@ class FakeStream:
         pass
 
 
-def test_tls_upgrade_keeps_socket_claims() -> None:
-    claims: list[Any] = []
+def test_tls_upgrade_keeps_socket_captures() -> None:
+    captures: list[Any] = []
 
     class Owner:
-        def claim(self, network: Any) -> None:
-            claims.append(network)
+        def capture(self, network: Any) -> None:
+            captures.append(network)
 
-    upgraded = _ClaimedStream(FakeStream("tcp")).start_tls(ssl.create_default_context())  # type: ignore[arg-type]
-    assert isinstance(upgraded, _ClaimedStream)
+    upgraded = _CapturedStream(FakeStream("tcp")).start_tls(ssl.create_default_context())  # type: ignore[arg-type]
+    assert isinstance(upgraded, _CapturedStream)
 
     def drive() -> None:
         _driver.set(Owner())  # type: ignore[arg-type]
@@ -612,7 +609,7 @@ def test_tls_upgrade_keeps_socket_claims() -> None:
         upgraded.write(b"w")
 
     copy_context().run(drive)
-    assert [claim.name for claim in claims] == ["tls", "tls"]
+    assert [capture.name for capture in captures] == ["tls", "tls"]
 
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl is not installed")
@@ -652,7 +649,7 @@ def test_expired_poll_before_headers_closes_reused_tls_connection(
 
 
 @pytest.mark.parametrize("missing", ["_pool", "_network_backend"])
-def test_poll_pool_falls_back_without_backend_hook(
+def test_poll_connections_falls_back_without_backend_hook(
     monkeypatch: pytest.MonkeyPatch, missing: str
 ) -> None:
     original = httpx.HTTPTransport.__init__
@@ -673,7 +670,7 @@ def test_poll_pool_falls_back_without_backend_hook(
             sdk.get_job("job-1")
             sdk.get_job("job-1")
             pool = sdk._poll_http._transport.current()._pool  # type: ignore[attr-defined]
-            assert not isinstance(pool._network_backend, _ClaimingBackend)
+            assert not isinstance(pool._network_backend, _CapturingBackend)
             assert pool._max_keepalive_connections == 0
         assert state["connections"] == 2
 

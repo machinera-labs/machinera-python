@@ -43,9 +43,11 @@ def recovery_guidance(error: APIError) -> str:
     elif isinstance(error, RecoverableJobError) or (
         isinstance(error, (APIConnectionError, APIStatusError))
         and error.retryable is True
-        and error.phase in ("job_submit", "submit")
+        and error.phase in ("job_submit", "submit", "upload_init", "upload_put")
     ):
-        action = "Row 5: recover by phase and saved operation key."
+        action = (
+            "Row 5: recover by phase; file resume uses the current operation key and upload ID."
+        )
     elif error.is_transient:
         action = "Row 6: pause before repeating the identical call with the same key."
     else:
@@ -66,6 +68,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Correct the local configuration or input before retrying.", file=sys.stderr)
         return 1
     except APIError as error:
+        print(f"Error code: {error.code}; request ID: {error.request_id}", file=sys.stderr)
         print(recovery_guidance(error), file=sys.stderr)
         return 1
     sys.stdout.write(result.text)

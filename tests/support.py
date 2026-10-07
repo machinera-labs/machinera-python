@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -53,7 +54,7 @@ def result(text: str = "  exact\ntext  ") -> dict[str, Any]:
         "text": text,
         "words": [],
         "segments": [],
-        "warnings": [{"code": "quality_notice", "extra": {"keep": [None, ""]}}],
+        "warnings": [{"code": 8001, "extra": {"keep": [None, ""]}}],
         "usage": {"type": "duration", "seconds": 2.5},
     }
 
@@ -127,7 +128,7 @@ def client(
         base_url=API,
         transport=httpx.MockTransport(handler),
         clock=clock,
-        wall_clock=lambda: 1_700_000_000,
+        wall_clock=kwargs.pop("wall_clock", lambda: WALL),
         random_source=lambda: 0.5,
         **kwargs,
     )
@@ -139,13 +140,13 @@ def sync_upload(sdk: Any, **kwargs: Any) -> Any:
     )
 
 
-def refused(code: str, retryable: bool = True) -> httpx.Response:
+def refused(code: int, retryable: bool = True) -> httpx.Response:
     return httpx.Response(
         503, json={"error": {"code": code, "retryable": retryable}}, headers={"x-request-id": "r-1"}
     )
 
 
-def failed_job(code: str = "job_shed", retryable: bool = True) -> httpx.Response:
+def failed_job(code: int = 5006, retryable: bool = True) -> httpx.Response:
     return httpx.Response(
         200,
         json={"id": "job-1", "status": "error", "error": {"code": code, "retryable": retryable}},
@@ -162,37 +163,21 @@ def submit(sdk: Any, source: str, key: str | None) -> Any:
 
 def refused_sync(request: httpx.Request) -> httpx.Response | None:
     if request.url.path == "/v1/audio/transcriptions":
-        return httpx.Response(
-            503, json={"error": {"code": "inline_admission_refused", "retryable": True}}
-        )
+        return httpx.Response(503, json={"error": {"code": 4008, "retryable": True}})
     return None
 
 
 def grant(data: dict[str, Any], **changes: Any) -> dict[str, Any]:
-    return {
-        "upload_id": "upload-1",
-        "state": "pending",
-        "put_url": SIGNED,
-        "method": "PUT",
-        "required_headers": {
+    # Fixture follows the published UploadGrant schema.
+    response = json.loads((Path(__file__).parent / "fixtures/upload_grant.json").read_text())
+    response["required_headers"].update(
+        {
             "Content-Length": str(data["size_bytes"]),
             "Content-Type": data["content_type"],
             "Content-MD5": data["content_md5"],
-            "If-None-Match": "*",
-        },
-        "expires_at": WALL + 300,
-        "upload_expires_at": WALL + 3600,
-        "limits": {
-            "max_upload_bytes": 2**31,
-            "sync_inline_body_bytes": 100,
-            "async_inline_body_bytes": 200,
-            "put_ttl_seconds": 300,
-            "upload_window_seconds": 3600,
-            "retention_max_seconds": 7200,
-            "policy_revision": "v1",
-        },
-        **changes,
-    }
+        }
+    )
+    return {**response, **changes}
 
 
 class Service:
@@ -246,8 +231,8 @@ def context(error: APIError, phase: str, upload_id: str | None = "upload-1") -> 
     assert error.__cause__ is error.__context__ is None
 
 
-def staged_unavailable(limits: dict[str, Any] | None) -> httpx.Response:
-    error: dict[str, Any] = {"code": "staged_uploads_unavailable", "retryable": False}
+def file_upload_unavailable(limits: dict[str, Any] | None) -> httpx.Response:
+    error: dict[str, Any] = {"code": 5001, "retryable": False}
     if limits is not None:
         error["limits"] = limits
     return httpx.Response(503, json={"error": error})
@@ -365,10 +350,10 @@ def queued(status: int = 200, *, job: str = "job-1") -> httpx.Response:
 
 
 def unavailable() -> httpx.Response:
-    return httpx.Response(503, json={"error": {"code": "service_unavailable"}})
+    return httpx.Response(503, json={"error": {"code": 4009}})
 
 
-def error_code(status: int, retryable: bool) -> str:
+def error_code(status: int, retryable: bool) -> int:
     return next(
         code
         for code, entry in ERROR_CODES.items()
@@ -399,7 +384,7 @@ def recorder(
     return recorded
 
 
-class ProbeFile(io.BytesIO):
+class TrackedFile(io.BytesIO):
     def __init__(
         self,
         data: bytes,
@@ -434,7 +419,7 @@ def held_slot(sdk: Any) -> Iterator[None]:
         assert release.wait(5)
         raise ValueError("input released")
 
-    source = ProbeFile(b"audio", on_read=block)
+    source = TrackedFile(b"audio", on_read=block)
     with ThreadPoolExecutor(1) as pool:
         if isinstance(sdk, Blocking):
             running = sdk.loop.create_task(
@@ -469,21 +454,21 @@ def request_phase(request: httpx.Request) -> str:
 
 class BlockedInputAccess:
     def __init__(self, blocked_phase: str) -> None:
-        probe = self
-        probe.entered = threading.Event()
-        probe.release_read = threading.Event()
-        probe.exchange_finished = threading.Event()
-        probe.connection_closed = threading.Event()
-        probe.client_closed = threading.Event()
-        probe.file_operations: list[str] = []
-        probe.requests: list[httpx.Request] = []
-        probe.expected_reads = {"hash": 1, "restore": 2, "upload": 3}[blocked_phase]
-        probe.entered_at: list[float] = []
+        tracker = self
+        tracker.entered = threading.Event()
+        tracker.release_read = threading.Event()
+        tracker.exchange_finished = threading.Event()
+        tracker.connection_closed = threading.Event()
+        tracker.client_closed = threading.Event()
+        tracker.file_operations: list[str] = []
+        tracker.requests: list[httpx.Request] = []
+        tracker.expected_reads = {"hash": 1, "restore": 2, "upload": 3}[blocked_phase]
+        tracker.entered_at: list[float] = []
 
         def block() -> None:
-            probe.entered_at.append(time.monotonic())
-            probe.entered.set()
-            assert probe.release_read.wait(3)
+            tracker.entered_at.append(time.monotonic())
+            tracker.entered.set()
+            assert tracker.release_read.wait(3)
 
         class SlowUpload(io.BytesIO):
             reads = 0
@@ -491,15 +476,15 @@ class BlockedInputAccess:
 
             def seek(self, offset: int, whence: int = 0) -> int:
                 self.seeks += 1
-                probe.file_operations.append("seek")
+                tracker.file_operations.append("seek")
                 if blocked_phase == "restore" and self.seeks == 3:
                     block()
                 return super().seek(offset, whence)
 
             def read(self, size: int = -1) -> bytes:
                 self.reads += 1
-                probe.file_operations.append("read")
-                if blocked_phase != "restore" and self.reads == probe.expected_reads:
+                tracker.file_operations.append("read")
+                if blocked_phase != "restore" and self.reads == tracker.expected_reads:
                     block()
                 return super().read(size)
 
@@ -508,11 +493,11 @@ class BlockedInputAccess:
                 return None
 
             def close(self) -> None:
-                probe.connection_closed.set()
+                tracker.connection_closed.set()
 
         class ReadingTransport(httpx.BaseTransport):
             def handle_request(self, request: httpx.Request) -> httpx.Response:
-                probe.requests.append(request)
+                tracker.requests.append(request)
                 request.extensions["trace"](
                     "connection.connect_tcp.complete", {"return_value": Connection()}
                 )
@@ -520,13 +505,13 @@ class BlockedInputAccess:
                     request.read()
                     return httpx.Response(200, json={"text": ""})
                 finally:
-                    probe.exchange_finished.set()
+                    tracker.exchange_finished.set()
 
             def close(self) -> None:
-                probe.client_closed.set()
+                tracker.client_closed.set()
 
-        probe.source = SlowUpload(b"audio")
-        probe.transport = ReadingTransport()
+        tracker.source = SlowUpload(b"audio")
+        tracker.transport = ReadingTransport()
 
 
 class ReplayService(Service):
@@ -552,7 +537,7 @@ class ReplayService(Service):
             elif submitted != self.accepted:
                 return httpx.Response(
                     422,
-                    json={"error": {"code": "idempotency_payload_mismatch", "retryable": False}},
+                    json={"error": {"code": 1031, "retryable": False}},
                 )
         return response
 

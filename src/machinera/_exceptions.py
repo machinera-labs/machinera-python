@@ -3,35 +3,12 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from . import _codes
-from ._contract import ERROR_CODES
-
-# Refusals that prove an unkeyed synchronous request did not run, so replaying it is safe.
-SYNC_REPLAYABLE_CODES = frozenset(
-    code for code, entry in ERROR_CODES.items() if entry.retryable and entry.status in (400, 408)
-) | {
-    _codes.input_busy.code,
-    _codes.inline_admission_refused.code,
-    _codes.no_serving_capacity.code,
-}
-
-
-# Synchronous admission refusals: the service accepted no work, so the body can be
-# submitted once as a durable job. Only codes the contract marks retryable qualify.
-SYNC_FALLBACK_CODES = frozenset(
-    entry.code
-    for entry in (
-        _codes.inline_claim_timeout,
-        _codes.inline_admission_refused,
-        _codes.no_serving_capacity,
-    )
-    if entry.retryable
-)
+from ._contract import SYNC_FALLBACK_CODES, SYNC_REPLAYABLE_CODES, UPLOAD_EXPIRED_CODES
 
 
 def retry_eligible(
     status: int | None,
-    code: str | None,
+    code: int | None,
     retryable: bool | None,
     replay_safe: bool,
     replay_after_send: bool = False,
@@ -84,7 +61,7 @@ class MachineraError(Exception):
         """True when repeating the identical call, as made, is safe and may succeed.
         See api.md#machineraerror for the decision table.
         """
-        if isinstance(self, TranscriptionInterrupted):
+        if isinstance(self, TranscriptionInterrupted) or getattr(self, "_key_rotated", False):
             return False
         sdk_key = getattr(self, "_caller_key", None) is False
         lost = getattr(self, "_submission_lost", False)
@@ -135,7 +112,7 @@ class APIError(MachineraError):
         *,
         status_code: int | None = None,
         body: dict[str, object] | None = None,
-        code: str | None = None,
+        code: int | None = None,
         retryable: bool | None = None,
         request_id: str | None = None,
         job_id: str | None = None,
@@ -149,6 +126,8 @@ class APIError(MachineraError):
         self.message = message
         self.status_code = status_code
         self.body = body
+        if code is not None and type(code) is not int:
+            raise TypeError("code must be an integer or None")
         self.code = code
         self.retryable = (
             False
@@ -163,11 +142,12 @@ class APIError(MachineraError):
         self.upload_id = upload_id
         self.storage_code = storage_code
         self._file_released: threading.Event | None = None
-        self._inline_cap: int | None = None
+        self._multipart_cap: int | None = None
         self._local = False
         self._sync_replay = False
         self._caller_key: bool | None = None
         self._submission_lost = False
+        self._key_rotated = False
 
     def __str__(self) -> str:
         text = super().__str__()
@@ -276,5 +256,9 @@ def invalid_response(message: str, status_code: int) -> APIResponseValidationErr
     return APIResponseValidationError(message, status_code=status_code, retryable=False)
 
 
-def expired_upload(message: str = "Upload has expired; recover any accepted job") -> UploadError:
-    return UploadError(message, code=_codes.upload_expired.code, retryable=False)
+def expired_upload(
+    message: str = "Upload has expired; recover any accepted job", *, status_code: int | None = None
+) -> UploadError:
+    return UploadError(
+        message, code=next(iter(UPLOAD_EXPIRED_CODES)), status_code=status_code, retryable=False
+    )

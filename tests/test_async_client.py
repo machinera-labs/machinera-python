@@ -73,7 +73,7 @@ async def test_client_identity_equality_and_hashing() -> None:
 @pytest.mark.parametrize(
     "mode,fmt",
     [("sync", "json"), ("sync", "text"), ("sync", "verbose_json")]
-    + [(mode, "json") for mode in ("keyed", "size", "staged")],
+    + [(mode, "json") for mode in ("keyed", "size", "file_upload")],
 )
 async def test_async_transport_selection_preserves_payload_and_ownership(
     text: str, fmt: Any, mode: str
@@ -85,7 +85,7 @@ async def test_async_transport_selection_preserves_payload_and_ownership(
 
     async def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
-        if mode == "staged":
+        if mode == "file_upload":
             response = service(request)
             return completed(text) if request.method == "GET" else response
         if request.method == "GET":
@@ -101,7 +101,7 @@ async def test_async_transport_selection_preserves_payload_and_ownership(
             else httpx.Response(200, json=result(text))
         )
 
-    limits = Limits(1, 2) if mode == "staged" else Limits(1) if mode == "size" else Limits()
+    limits = Limits(1, 2) if mode == "file_upload" else Limits(1) if mode == "size" else Limits()
     async with client(handler, limits=limits) as sdk:
         output = await sdk.transcribe_file(
             source,
@@ -116,10 +116,10 @@ async def test_async_transport_selection_preserves_payload_and_ownership(
         "/v1/audio/transcriptions"
         if mode == "sync"
         else "/v1/uploads"
-        if mode == "staged"
+        if mode == "file_upload"
         else "/v1/transcription_jobs"
     )
-    if mode == "staged":
+    if mode == "file_upload":
         assert service.puts == [AUDIO]
 
 
@@ -237,8 +237,8 @@ async def test_concurrent_calls_have_separate_state(max_concurrency: int | None)
     assert peak == (1 if max_concurrency == 1 else 2)
 
 
-@pytest.mark.parametrize("staged", [False, True])
-async def test_hash_and_chunk_reads_do_not_block_loop(staged: bool) -> None:
+@pytest.mark.parametrize("file_upload", [False, True])
+async def test_hash_and_chunk_reads_do_not_block_loop(file_upload: bool) -> None:
     reading = threading.Event()
     threads: list[int] = []
     ticks = 0
@@ -263,11 +263,11 @@ async def test_hash_and_chunk_reads_do_not_block_loop(staged: bool) -> None:
     service = Service()
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        return service(request) if staged else httpx.Response(200, json=result())
+        return service(request) if file_upload else httpx.Response(200, json=result())
 
     task = asyncio.create_task(ticker())
     try:
-        async with client(handler, limits=Limits(1, 2) if staged else Limits()) as sdk:
+        async with client(handler, limits=Limits(1, 2) if file_upload else Limits()) as sdk:
             await sdk.transcribe_file(SlowFile(AUDIO), filename="clip.wav", model=MODEL)
     finally:
         task.cancel()
@@ -386,7 +386,7 @@ async def test_cancel_while_opening_closes_owned_handle(monkeypatch: pytest.Monk
     assert source.closed
 
 
-async def test_cancel_partial_admission_keeps_job_and_closes_response() -> None:
+async def test_cancel_partial_acceptance_keeps_job_and_closes_response() -> None:
     cancellations: list[asyncio.CancelledError] = []
     entered = asyncio.Event()
     closed = asyncio.Event()

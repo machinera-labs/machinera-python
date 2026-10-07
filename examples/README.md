@@ -43,8 +43,8 @@ clients. `submit_and_resume.py` is the corresponding blocking-client example.
 ## Large files
 
 Save a fresh random operation key before starting each independent transcription.
-The same file call automatically stages inputs above the durable-job inline limit
-(`Limits.job_inline_body_bytes`):
+The same file call automatically uploads inputs above the durable-job multipart limit
+(`Limits.job_multipart_body_bytes`):
 
 ```sh
 python examples/transcribe_large_file.py recording.flac --operation-key YOUR_SAVED_KEY
@@ -55,9 +55,12 @@ On failure, the example writes recovery context to stderr; keep it private.
 Resolve the failure before resuming with identical bytes and options. If a job ID
 is available, add `--job-id SAVED_JOB_ID` to the `--resume` command so recovery only
 polls; optionally pass `--upload-id SAVED_UPLOAD_ID` to preserve context. Before
-acceptance, `--resume` replays staged initialization, PUT and submission with the
+acceptance, `--resume` replays file upload initialization, PUT and submission with the
 saved key. This recovery
-form is for staged inputs; inline job recovery uses the original keyed file call
+form must use the current key and upload ID printed by the latest error, because
+replacement can rotate the original key. `is_transient=False` after rotation
+means an identical original call is unsuitable; apply the failure table to decide
+whether to continue with saved context. This form is for file upload inputs; multipart job recovery uses the original keyed file call
 until a job ID is known. Do not reuse the sample key for independent operations.
 
 ## Submit, save, and resume
@@ -92,3 +95,16 @@ including when the state file does not exist.
 
 Run offline checks with `pytest -q tests/test_examples.py`. They use stubbed HTTP
 responses and require no live key or service access.
+
+These examples require SDK 0.2.0 and the numeric-code API. `handle_errors.py`
+prints the integer error code and request ID for support. A zero Retry-After
+value still leaves the SDK’s bounded retry delays in effect.
+
+A definitive upload expiry at job submission is recovered automatically within
+the configured retry budget and deadline. If expiry recovery is exhausted, follow
+the exception's guidance: start a new call with a fresh operation key and allow
+more time or reduce upload concurrency. A lost submission response uses the
+current job operation key to recover accepted work without uploading again.
+After a definitive expiry refusal, replacement uses new initialization and
+submission keys; save the current `operation_key` and `upload_id` from any error
+for continuation. Grant refresh does not reset the completion grace period.

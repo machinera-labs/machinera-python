@@ -25,7 +25,7 @@ def render() -> str:
     return (
         f"{START}\n"
         "Guaranteed minimums:\n\n"
-        f"- Idempotency replay window ≥ {duration(DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S)}.\n"
+        f"- Idempotency replay period ≥ {duration(DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S)}.\n"
         f"- Result retention ≥ {duration(DEFAULT_RESULT_RETENTION_S)}.\n\n"
         "Deployments may lengthen but never shorten either period below these defaults.\n"
         f"{END}"

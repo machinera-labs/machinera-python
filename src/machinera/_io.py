@@ -61,7 +61,7 @@ class _StorageLogFilter(logging.Filter):
 logging.getLogger("httpx").addFilter(_StorageLogFilter())
 
 
-class _ClaimedStream(httpcore.NetworkStream):
+class _CapturedStream(httpcore.NetworkStream):
     """Hand the socket to whichever exchange is reading or writing it.
 
     A reused keep-alive connection emits no connect event, so this is how a watchdog
@@ -71,17 +71,17 @@ class _ClaimedStream(httpcore.NetworkStream):
     def __init__(self, stream: httpcore.NetworkStream) -> None:
         self.stream = stream
 
-    def _claim(self) -> None:
+    def _capture(self) -> None:
         exchange = _driver.get()
         if exchange is not None:
-            exchange.claim(self.stream)
+            exchange.capture(self.stream)
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
-        self._claim()
+        self._capture()
         return self.stream.read(max_bytes, timeout)
 
     def write(self, buffer: bytes, timeout: float | None = None) -> None:
-        self._claim()
+        self._capture()
         self.stream.write(buffer, timeout)
 
     def close(self) -> None:
@@ -93,13 +93,13 @@ class _ClaimedStream(httpcore.NetworkStream):
         server_hostname: str | None = None,
         timeout: float | None = None,
     ) -> httpcore.NetworkStream:
-        return _ClaimedStream(self.stream.start_tls(ssl_context, server_hostname, timeout))
+        return _CapturedStream(self.stream.start_tls(ssl_context, server_hostname, timeout))
 
     def get_extra_info(self, info: str) -> Any:
         return self.stream.get_extra_info(info)
 
 
-class _ClaimingBackend(httpcore.NetworkBackend):
+class _CapturingBackend(httpcore.NetworkBackend):
     def __init__(self, backend: httpcore.NetworkBackend) -> None:
         self.backend = backend
 
@@ -111,7 +111,7 @@ class _ClaimingBackend(httpcore.NetworkBackend):
         local_address: str | None = None,
         socket_options: Iterable[Any] | None = None,
     ) -> httpcore.NetworkStream:
-        return _ClaimedStream(
+        return _CapturedStream(
             self.backend.connect_tcp(host, port, timeout, local_address, socket_options)
         )
 
@@ -120,7 +120,7 @@ class _ClaimingBackend(httpcore.NetworkBackend):
 
 
 def keepalive_transport(limits: httpx.Limits, fallback: httpx.Limits) -> httpx.HTTPTransport:
-    """Build a claiming keep-alive transport, or a fallback-limits one if httpx changed.
+    """Build a capturing keep-alive transport, or a fallback-limits one if httpx changed.
 
     The backend hook uses private httpx and httpcore attributes; without them a reused
     connection could not be closed by a deadline, so keep-alive is disabled instead.
@@ -132,7 +132,7 @@ def keepalive_transport(limits: httpx.Limits, fallback: httpx.Limits) -> httpx.H
         backend, httpcore.NetworkBackend
     ):
         return httpx.HTTPTransport(limits=fallback, trust_env=False)
-    pool._network_backend = _ClaimingBackend(backend)
+    pool._network_backend = _CapturingBackend(backend)
     return transport
 
 
@@ -246,7 +246,7 @@ class Exchange:
         if "response_closed" not in event and not event.endswith(".failed"):
             self._check()
 
-    def claim(self, network: httpcore.NetworkStream) -> None:
+    def capture(self, network: httpcore.NetworkStream) -> None:
         with self.network_lock:
             if self.cancelled.is_set():
                 raise DeadlineExceededError("HTTP exchange cancelled")

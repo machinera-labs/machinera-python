@@ -468,7 +468,7 @@ def test_error_example_known_job_guidance(error: str, expected: str) -> None:
     assert expected in module.recovery_guidance(failure)
 
 
-def test_error_example_does_not_resume_missing_admitted_job(
+def test_error_example_does_not_resume_missing_accepted_job(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], example_client: Callable[..., None]
 ) -> None:
     module = load_example("handle_errors")
@@ -480,7 +480,7 @@ def test_error_example_does_not_resume_missing_admitted_job(
             return httpx.Response(413)
         if request.method == "POST":
             return accepted()
-        return httpx.Response(404, json={"error": {"code": "job_not_found"}})
+        return httpx.Response(404, json={"error": {"code": 1036}})
 
     example_client(module, handler)
     assert module.main([str(source)]) == 1
