@@ -1033,7 +1033,8 @@ def test_retry_and_status_logs_are_sanitized(
     with client(handler) as sdk:
         output = sdk.transcribe_url(url, model=MODEL)
     records = [r for r in caplog.records if r.name == "machinera"]
-    retry, *transitions = records
+    retry = next(r for r in records if r.getMessage().startswith("Retrying "))
+    transitions = [r for r in records if r.getMessage().startswith("Job ")]
     assert retry.levelno == logging.DEBUG
     assert retry.getMessage() == (
         "Retrying POST /transcription_jobs in 0.438s after attempt 1 of 3 "
@@ -1055,7 +1056,11 @@ def test_job_poll_retry_logs_path_template(
     responses = iter([httpx.Response(502)])
     with client(lambda _: next(responses, None) or completed()) as sdk:
         sdk.resume("job-1")
-    retry = next(r for r in caplog.records if r.name == "machinera")
+    retry = next(
+        r
+        for r in caplog.records
+        if r.name == "machinera" and r.getMessage().startswith("Retrying ")
+    )
     assert "GET /transcription_jobs/{job_id} " in retry.getMessage()
 
 

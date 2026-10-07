@@ -239,6 +239,7 @@ class Machinera(Core):
             with life.condition:
                 life.active -= 1
                 life.condition.notify_all()
+            self._log_timing(call, "total", call.start)
         if failure is not None:
             self._attach(failure, call)
             raise failure from None

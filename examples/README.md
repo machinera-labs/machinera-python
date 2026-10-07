@@ -1,6 +1,6 @@
 # Examples
 
-From the repository root, install with `python -m pip install -e .` and set
+Install with `pip install machinera` and, from the repository root, set
 `MACHINERA_API_KEY` in your environment. Each example constructs `Machinera()` or
 `AsyncMachinera()`, which read `MACHINERA_API_KEY` and, when set, `MACHINERA_BASE_URL`
 from the environment, and uses the `transcribe-v1` model.
@@ -17,8 +17,8 @@ python examples/handle_errors.py recording.wav
 Replace the sample URL with a direct audio URL you are authorized to use. The scripts
 write the exact transcript to stdout, without trimming or adding a newline. Redirect
 stdout to a private file if needed; do not send it to application logs. Avoid putting
-sensitive signed URLs in shell history. `handle_errors.py` prints only fixed recovery
-guidance to stderr and returns exit code 1 on API failures or local argument errors.
+sensitive signed URLs in shell history. `handle_errors.py` prints the
+[error output](#error-output) to stderr and returns exit code 1 on API failures or local argument errors.
 It catches `APIError` for service and transport recovery metadata, and
 `ValueError`/`TypeError` for local configuration and input validation.
 `recovery_guidance` maps failures to rows 1–7 of the
@@ -96,8 +96,12 @@ including when the state file does not exist.
 Run offline checks with `pytest -q tests/test_examples.py`. They use stubbed HTTP
 responses and require no live key or service access.
 
-These examples require SDK 0.2.0 and the numeric-code API. `handle_errors.py`
-prints the integer error code and request ID for support. A zero Retry-After
+## Error output
+
+These examples require the SDK and the numeric-code API. On API failures,
+`handle_errors.py` prints the integer error code and request ID (or `None` when
+unavailable), followed by fixed recovery guidance, to stderr. Local argument
+errors print only fixed guidance. A zero Retry-After
 value still leaves the SDK’s bounded retry delays in effect.
 
 A definitive upload expiry at job submission is recovered automatically within

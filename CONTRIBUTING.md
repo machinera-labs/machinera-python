@@ -32,6 +32,8 @@ tools without the lock. After intentionally changing dependencies, regenerate th
 lock with `uv lock`. Runtime dependency ranges live in `pyproject.toml`; the
 development lock does not constrain users. CI also installs the lowest supported
 runtime versions with pip to check those ranges independently of the lock.
+`scripts/minimum_dependencies.py` derives exact pins from the installed package
+metadata and verifies the installed versions before that suite runs.
 
 `src/machinera/_contract.py` is generated from the numeric public API snapshot in
 `scripts/public_contract.json`; do not edit it by hand. Refresh that snapshot from
@@ -43,7 +45,13 @@ Use `--snapshot <public-snapshot.json> --upload-schema <upload-schema.json>` to
 refresh both inputs; add `--check` to compare published inputs without writing.
 The generator renders `tests/fixtures/upload_grant.json` from that schema.
 Keep only public numeric descriptors, behavior sets and constants in the snapshot. CI also runs
-`uv run python scripts/check_release.py --source-only`. The copy guard
+`uv run python scripts/check_release.py --source-only`. Exact `machinera==X.Y.Z`
+install pins in `README.md`, `api.md`, and `examples/` are forbidden; use
+`pip install machinera` instead. The previous released version
+(the next version heading below the current version in `CHANGELOG.md`) must not
+appear elsewhere in the shipped source tree. Local environments, caches, and
+build artifacts are excluded. Historical references in `CHANGELOG.md` are exempt.
+The copy guard
 uses fingerprinted terms in `scripts/public_terms.json` to avoid publishing the
 restricted vocabulary itself; its exact exceptions cover public wire fields and
 standard Python/HTTP library APIs.
@@ -70,6 +78,13 @@ Review `api.md` against the exported API at every release (tests check that ever
 export has an entry) and check examples on the supported Python matrix. Use
 semantic versions and move completed changelog entries into a dated release
 section when preparing a release.
+
+Run `uv run python scripts/bump_version.py X.Y.Z` to set a newer package version
+and insert an empty changelog release section
+below `Unreleased`. The script then runs the source release checks. If references
+remain, it exits non-zero and leaves its edits in place for review. Update remaining
+references, refresh `uv.lock` with `uv lock`, and rerun
+`uv run python scripts/check_release.py --source-only` before building the release.
 
 The tag workflow runs only in `machinera-labs/machinera-python`. Maintainers must
 configure PyPI trusted publishing for `publish.yml` and the GitHub environment

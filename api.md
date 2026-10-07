@@ -1,12 +1,14 @@
 # API reference
 
+Install with `pip install machinera`.
+
 Import every documented symbol from `machinera`. The SDK has a blocking client
 (`Machinera`) and a native asyncio client (`AsyncMachinera`). Separately, a
 *durable job* is a server-side transcription job that can be resumed by ID;
 `transport="job"` and `Limits.job_multipart_body_bytes` refer to durable jobs. This
 file is the authority; the README summarizes it.
 
-Version 0.2.0 uses opaque integer error and warning codes. String codes are
+The SDK uses opaque integer error and warning codes. String codes are
 unsupported. Error classes combine HTTP status with generated numeric behavior
 sets; unknown integers retain status-based handling and explicit retry guidance.
 Code numbers do not determine retry eligibility by their range.
@@ -62,6 +64,38 @@ Omitted `timeout` and `max_retries` use the [defaults](#defaults).
 `MACHINERA_LOG=debug` or `MACHINERA_LOG=info`, read at construction, sets the level
 of the `machinera` logger and attaches a stderr handler if it has none; other
 values leave logging unchanged.
+
+At INFO (also included at DEBUG), both clients log elapsed wall seconds for
+`upload_init`, `upload_put`, `submit` (an uploaded-file descriptor), `sync_submit`,
+`job_submit` (a URL or multipart body), and `poll`. Each completed HTTP attempt,
+including a failed attempt, emits one timing line with sanitized `request_id` and
+`job_id` when available. Repeated attempts emit separate lines; retry backoff is
+included in `total`, not in individual request timings. Successful `upload_put`
+lines include file bytes, decimal MB, and MB/s over the PUT exchange; an
+unmeasurably short exchange reports the rate as unavailable. Multipart submission
+timings include both upload and server response time and cannot separate them.
+Synchronous fallback logs `sync_submit fallback to job` with its numeric
+`reason_code` (or `None` for a size refusal without a code).
+
+`job queued` and `job processing` lines measure time between observed poll status
+transitions, starting at the first poll that reports that state and ending when a
+different state is observed, including `completed` or `error`. These are
+client-observed approximations: transition detection is bounded by the interval
+between successful polls, including request latency, `Retry-After`, and retries.
+States that occur entirely between polls can be missed; resumed jobs only measure
+states observed during that call. These timings do not measure server compute time.
+The `total` line covers the current call, including local preparation, concurrency
+waits, retries, and polling, and is also emitted when the call fails or is interrupted.
+Poll request timings overlap the observed job-state durations; do not sum all lines.
+
+For example, enable diagnostics before constructing the client:
+
+```sh
+MACHINERA_LOG=info python transcribe.py
+```
+
+Timing logs contain no signed URLs, API or idempotency keys, file names, audio, or
+transcript content. Logging remains quiet at WARNING or the default logging level.
 
 Explicit invalid values fail without environment fallback. No dotenv discovery
 or endpoint probing occurs. Header names and values are validated before HTTP.
@@ -534,7 +568,8 @@ body once as a multipart durable job under the same operation key (`phase` becom
 limit (99,614,720 bytes). A larger body raises the refusal. A refusal after a grant
 was issued never falls back. Storage failures raise `UploadError`, retain status
 and sanitized `storage_code`, and never expose a signed URL or storage message.
-Storage 401/403 and redirects are never retried or followed.
+Storage 401 and redirects are never retried or followed. For storage 403, see the
+[expired-grant refresh rule](#file-upload-recovery-and-expiry).
 
 #### Common operation exceptions
 
@@ -709,6 +744,7 @@ duration constraints; raising a local threshold does not change server limits.
 
 ```python
 TranscriptionResult(
+    *,
     text: str,
     warnings: Any = None,
     request_id: str | None = None,

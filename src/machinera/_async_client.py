@@ -197,6 +197,7 @@ class AsyncMachinera(Core):
             life.active -= 1
             if not life.active:
                 life.idle.set()
+            self._log_timing(call, "total", call.start)
         if failure is not None:
             self._attach(failure, call)
             raise failure from None

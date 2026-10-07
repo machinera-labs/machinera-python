@@ -4,6 +4,7 @@ import argparse
 import ast
 import hashlib
 import json
+import os
 import re
 import tarfile
 import zipfile
@@ -15,6 +16,8 @@ VERSION_FILE = Path(__file__).resolve().parents[1] / "src" / "machinera" / "_ver
 
 
 ROOT = VERSION_FILE.parents[2]
+INSTALL_PIN = re.compile(r"\bmachinera==([0-9]+\.[0-9]+\.[0-9]+)\b")
+RELEASE_HEADING = re.compile(r"^## ([0-9]+\.[0-9]+\.[0-9]+)(?:[ \t].*)?$", re.MULTILINE)
 TERM_POLICY = Path(__file__).with_name("public_terms.json")
 
 
@@ -103,7 +106,76 @@ def check_numeric_codes(source: str) -> None:
             raise ValueError("String error code in package source")
 
 
+def install_pin_paths(root: Path) -> list[Path]:
+    paths = [root / "README.md", root / "api.md"]
+    paths.extend(path for path in (root / "examples").rglob("*") if path.is_file())
+    return paths
+
+
+def check_install_pins(root: Path) -> None:
+    for path in install_pin_paths(root):
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+        ):
+            if INSTALL_PIN.search(line):
+                raise ValueError(
+                    f"Exact install pin forbidden: {path.relative_to(root)}:{number}: "
+                    "use pip install machinera"
+                )
+
+
+def shipped_paths(root: Path) -> list[Path]:
+    # Exclude local environments and generated artifacts, which are not shipped.
+    excluded = {
+        ".git",
+        ".venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "build",
+        "dist",
+        "htmlcov",
+    }
+    paths = []
+    for directory, folders, files in os.walk(root):
+        folders[:] = sorted(
+            name for name in folders if name not in excluded and not name.endswith(".egg-info")
+        )
+        paths.extend(
+            Path(directory) / name
+            for name in sorted(files)
+            if name not in {".git", ".env", ".coverage", ".DS_Store"}
+            and not name.endswith((".pyc", ".pyo"))
+        )
+    return paths
+
+
+def check_previous_version(root: Path) -> None:
+    version = package_version(root)
+    changelog = root / "CHANGELOG.md"
+    releases = RELEASE_HEADING.findall(changelog.read_text(encoding="utf-8"))
+    if version not in releases:
+        raise ValueError(f"Missing CHANGELOG heading for package version {version}")
+    previous = releases[releases.index(version) + 1 :]
+    if not previous:
+        return
+    needle = re.compile(r"(?<![0-9.])" + re.escape(previous[0]) + r"(?![0-9])")
+    for path in shipped_paths(root):
+        if path == changelog:
+            continue
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+        ):
+            if needle.search(line):
+                raise ValueError(
+                    f"Previous release version {previous[0]}: {path.relative_to(root)}:{number}"
+                )
+
+
 def check_public_sources(root: Path = ROOT) -> None:
+    check_install_pins(root)
+    check_previous_version(root)
     paths = [root / name for name in ("README.md", "api.md", "CHANGELOG.md")]
     for name in ("src/machinera", "examples", "tests"):
         paths.extend(
@@ -118,8 +190,9 @@ def check_public_sources(root: Path = ROOT) -> None:
                 raise ValueError(f"Public-copy check failed: {path.relative_to(root)}:{number}")
 
 
-def package_version() -> str:
-    for element in ast.parse(VERSION_FILE.read_text(encoding="utf-8")).body:
+def package_version(root: Path = ROOT) -> str:
+    version_file = root / "src" / "machinera" / "_version.py"
+    for element in ast.parse(version_file.read_text(encoding="utf-8")).body:
         if (
             isinstance(element, ast.Assign)
             and [getattr(target, "id", None) for target in element.targets] == ["__version__"]

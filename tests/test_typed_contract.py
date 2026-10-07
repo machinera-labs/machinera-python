@@ -290,7 +290,7 @@ def test_served_language_hint(language: str) -> None:
 def test_unsupported_language_fails_before_http() -> None:
     calls = []
     with client(lambda request: calls.append(request)) as sdk:
-        with pytest.raises(ValueError, match="English"):
+        with pytest.raises(ValueError, match=contract.SERVED_LANGUAGE):
             sdk.transcribe_url("https://audio.example/clip.wav", model=MODEL, language="fr")
     assert calls == []
 

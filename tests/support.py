@@ -19,10 +19,10 @@ from typing import Any
 import httpx
 
 from machinera import APIError, AsyncMachinera, Limits, Machinera
-from machinera._contract import ERROR_CODES
+from machinera._contract import ERROR_CODES, PUBLISHED_MODEL_ALIASES
 
 API = "https://api.machinera.com/v1"
-MODEL = "transcribe-v1"
+(MODEL,) = PUBLISHED_MODEL_ALIASES
 CREDENTIAL = "test-credential"
 AUDIO = b"audio-bytes" * 15000
 WALL = 1_700_000_000

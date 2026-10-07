@@ -223,7 +223,7 @@ class TerminalJobError(APIError):
 
 
 class UploadError(APIError):
-    """The file upload failed or was refused; see the README's Large files section."""
+    """The file upload failed or was refused; see api.md#file-upload-recovery-and-expiry."""
 
 
 class IntegrityError(UploadError):

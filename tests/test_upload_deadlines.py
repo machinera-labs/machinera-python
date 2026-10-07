@@ -9,6 +9,7 @@ import pytest
 from support import AUDIO, WALL, Clock, Service, client, grant, transcribe
 
 import machinera as m
+from machinera._contract import IDEMPOTENCY_KEY_HEADER
 from machinera._uploads import Grant
 
 
@@ -34,7 +35,7 @@ def test_put_spanning_grant_is_confirmed_or_refreshed(answer: int, asynchronous:
     def handler(request: httpx.Request) -> httpx.Response:
         response = service(request)
         if request.url.path.endswith("/uploads"):
-            keys.append(request.headers["idempotency-key"])
+            keys.append(request.headers[IDEMPOTENCY_KEY_HEADER])
             data = grant(service.descriptor, expires_at=WALL + int(clock.now) + 3600)
             return httpx.Response(201 if len(keys) == 1 else 200, json=data)
         if request.method == "PUT" and len(service.puts) == 1:
@@ -85,12 +86,12 @@ def test_incomplete_submission_refreshes_grant_and_keeps_identity(asynchronous: 
     def handler(request: httpx.Request) -> httpx.Response:
         response = service(request)
         if request.url.path.endswith("/uploads"):
-            init_keys.append(request.headers["idempotency-key"])
+            init_keys.append(request.headers[IDEMPOTENCY_KEY_HEADER])
             return httpx.Response(
                 200, json=grant(service.descriptor, expires_at=WALL + int(clock.now) + 3600)
             )
         if request.url.path.endswith("/transcription_jobs"):
-            submit_keys.append(request.headers["idempotency-key"])
+            submit_keys.append(request.headers[IDEMPOTENCY_KEY_HEADER])
             if len(submit_keys) == 1:
                 clock.now = 3601
                 return httpx.Response(409, json={"error": {"code": 1002, "retryable": False}})
@@ -164,9 +165,9 @@ def test_ambiguous_submit_must_be_refused_before_keys_change(asynchronous: bool)
         if len(submits) == 2:
             assert len([r for r in requests if r.method == "PUT"]) == 1
             assert submits[0].content == request.content
-            assert submits[0].headers["idempotency-key"] == request.headers["idempotency-key"]
+            assert submits[0].headers["idempotency-key"] == request.headers[IDEMPOTENCY_KEY_HEADER]
             return httpx.Response(410, json={"error": {"code": 1003, "retryable": False}})
-        key = request.headers["idempotency-key"]
+        key = request.headers[IDEMPOTENCY_KEY_HEADER]
         assert key != submits[0].headers["idempotency-key"]
         accepted.setdefault(key, "job-1")
         return httpx.Response(202, json={"id": accepted[key]})
@@ -186,7 +187,7 @@ def test_observed_file_expiry_uses_new_keys_only_after_refusal(asynchronous: boo
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/uploads"):
-            key = request.headers["idempotency-key"]
+            key = request.headers[IDEMPOTENCY_KEY_HEADER]
             init_keys.append(key)
             upload_id = f"upload-{len(init_keys)}"
             return httpx.Response(
@@ -210,7 +211,7 @@ def test_observed_file_expiry_uses_new_keys_only_after_refusal(asynchronous: boo
 
             return completed()
         upload_id = json.loads(request.content)["upload_id"]
-        key = request.headers["idempotency-key"]
+        key = request.headers[IDEMPOTENCY_KEY_HEADER]
         submit_keys.append(key)
         if len(submit_keys) == 1:
             clock.now += 301
@@ -243,7 +244,7 @@ def test_saved_expired_upload_is_confirmed_before_replacement(asynchronous: bool
     def handler(request: httpx.Request) -> httpx.Response:
         response = service(request)
         if request.url.path.endswith("/uploads"):
-            init_keys.append(request.headers["idempotency-key"])
+            init_keys.append(request.headers[IDEMPOTENCY_KEY_HEADER])
             if len(init_keys) == 1:
                 return httpx.Response(410, json={"error": {"code": 1003, "retryable": False}})
         return response
@@ -354,7 +355,7 @@ def test_first_observation_can_follow_local_completion_by_more_than_grace(
                 200, headers={} if modified is None else {"Last-Modified": modified}
             )
         if request.url.path.endswith("/transcription_jobs"):
-            submissions.append((request.headers["idempotency-key"], request.content))
+            submissions.append((request.headers[IDEMPOTENCY_KEY_HEADER], request.content))
             if len(submissions) == 1:
                 return httpx.Response(
                     503,

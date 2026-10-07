@@ -564,3 +564,53 @@ def test_error_example_resumes_rate_limited_unkeyed_fallback(
     err = capsys.readouterr().err
     assert "Row 3: resume that job within your retry budget." in err
     assert "permanent" not in err
+
+
+@pytest.mark.parametrize("name", ["submit_and_resume", "async_submit_and_resume"])
+def test_submit_help_displays_parser_deadline(
+    name: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import argparse
+
+    defaults = []
+    add_argument = argparse.ArgumentParser.add_argument
+
+    def record(parser: argparse.ArgumentParser, *args: Any, **kwargs: Any) -> Any:
+        if "--deadline" in args:
+            defaults.append(kwargs["default"])
+        return add_argument(parser, *args, **kwargs)
+
+    monkeypatch.setattr(argparse.ArgumentParser, "add_argument", record)
+    module = load_example(name)
+    with pytest.raises(SystemExit) as caught:
+        output = module.main(["submit", "--help"])
+        if name.startswith("async_"):
+            asyncio.run(output)
+    assert caught.value.code == 0
+    assert len(defaults) == 1
+    assert f"default: {defaults[0]}" in capsys.readouterr().out
+
+
+def test_error_output_components(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], example_client: Callable[..., None]
+) -> None:
+    module = load_example("handle_errors")
+    source = tmp_path / "recording.wav"
+    source.write_bytes(b"audio")
+    example_client(
+        module,
+        lambda _: httpx.Response(
+            400, json={"error": {"code": 1009}}, headers={"x-request-id": "request-1"}
+        ),
+    )
+    assert module.main([str(source)]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    identity, guidance = output.err.splitlines()
+    assert identity == "Error code: 1009; request ID: request-1"
+    assert guidance.startswith("Row 7")
+    documentation = (EXAMPLES / "README.md").read_text()
+    assert "[error output](#error-output)" in documentation
+    canonical = " ".join(documentation.split("## Error output", 1)[1].split())
+    assert "integer error code and request ID" in canonical
+    assert "fixed recovery guidance, to stderr" in canonical

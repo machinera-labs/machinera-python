@@ -10,6 +10,7 @@ from typing import BinaryIO, TypeVar
 
 import httpx
 
+from ._contract import CONTENT_MD5_HEADER
 from ._exceptions import DeadlineExceededError, IntegrityError
 from ._files import resolve_name
 
@@ -124,7 +125,7 @@ class Multipart(httpx.SyncByteStream):
             self.headers = {
                 "Content-Type": f"multipart/form-data; boundary={boundary}",
                 "Content-Length": str(len(self.prefix) + self.size + len(self.suffix)),
-                "X-Content-MD5": digest.hexdigest(),
+                CONTENT_MD5_HEADER: digest.hexdigest(),
             }
 
     def abort(self) -> None:

@@ -5,22 +5,22 @@ and a native asyncio client (`AsyncMachinera`) with the same methods. The
 [API reference](https://github.com/machinera-labs/machinera-python/blob/main/api.md)
 is the authority for every behavior summarized here.
 
-SDK 0.2.0 requires the numeric-code API. Error and warning `code` values are
+This SDK requires the numeric-code API. Error and warning `code` values are
 integers; string codes are unsupported. SDK 0.1.x cannot talk to the server after
 this API cut. Record the integer `error.code` and `error.request_id` for support.
 
-## Install and pin
+## Install
 
 ```sh
-pip install "machinera==0.2.0"
+pip install machinera
 export MACHINERA_API_KEY="your-api-key"
 ```
 
 APIs listed under [CHANGELOG “Unreleased”](https://github.com/machinera-labs/machinera-python/blob/main/CHANGELOG.md#unreleased)
-require the next release and are not available in the pin above.
+require the next release and are not available in the latest published package.
 
 - Python 3.10 through 3.14. No audio decoding or conversion tools are needed.
-- Pin an exact version where installs must be reproducible. During `0.x`, minor
+- Manage reproducible installs in your project's lockfile. During `0.x`, minor
   releases may change the public API and patch releases are compatible fixes; read the
   [changelog](https://github.com/machinera-labs/machinera-python/blob/main/CHANGELOG.md)
   when upgrading.
@@ -68,7 +68,9 @@ Every submission may incur usage charges.
   service sent none; `elapsed_seconds`, the client's wall time including waiting to start
   and polling; and `duration` and `inference_seconds` when the service returns them.
 - **Direct audio URL:** the service fetches the URL itself; the SDK sends only the URL
-  string (at most 65,536 bytes of JSON) and no credentials or headers for it. Use an
+  string, bounded by `Limits.descriptor_bytes` (see
+  [defaults](https://github.com/machinera-labs/machinera-python/blob/main/api.md#defaults)),
+  and no credentials or headers for it. Use an
   `http` or `https` URL that returns the audio bytes with no further authentication,
   such as a pre-signed URL. A job may not start immediately, so a signed URL must stay valid
   until the job runs. Redirect handling is not specified; pass the final URL. The same
@@ -81,8 +83,10 @@ Every submission may incur usage charges.
 | Call | Route |
 | --- | --- |
 | `transcribe_url(...)` | Always a durable job (a server-side job resumable by ID). |
-| `transcribe_file(...)` with `idempotency_key`, or a client with `transport="job"` | Durable job: multipart up to `Limits.job_multipart_body_bytes` (52,428,800) encoded bytes, a file upload above it. |
-| `transcribe_file(...)` without a key, default `transport="auto"` | One synchronous request up to `Limits.sync_inline_body_bytes` (26,214,400) encoded bytes; above that, as with a key. |
+| `transcribe_file(...)` with `idempotency_key`, or a client with `transport="job"` | Durable job: multipart up to `Limits.job_multipart_body_bytes` encoded bytes, a file upload above it. |
+| `transcribe_file(...)` without a key, default `transport="auto"` | One synchronous request up to `Limits.sync_inline_body_bytes` encoded bytes; above that, as with a key. |
+
+See [defaults](https://github.com/machinera-labs/machinera-python/blob/main/api.md#defaults) for the byte limits.
 
 Encoded size is the file plus a few hundred bytes of multipart framing; a size equal to
 a limit takes the smaller route. About 13 minutes of 16 kHz 16-bit mono WAV, or about
@@ -539,7 +543,8 @@ Every call here is keyed, so rows 4 and 5's `"sync_submit"` case cannot occur.
 
 ## Long files
 
-An encoded file above `Limits.job_multipart_body_bytes` (52,428,800 bytes) is uploaded to
+An encoded file above `Limits.job_multipart_body_bytes` (see
+[defaults](https://github.com/machinera-labs/machinera-python/blob/main/api.md#defaults)) is uploaded to
 storage and then submitted as a job, automatically. The service sets the upload size
 limit, the upload expiry period, and the maximum audio duration (code
 `1015`); see the [public limits](https://api.machinera.com/docs/limits).

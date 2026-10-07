@@ -26,7 +26,10 @@ from pydantic import ValidationError
 from ._contract import (
     DEFAULT_MULTIPART_CAP_BYTES,
     ERROR_CODES,
+    IDEMPOTENCY_KEY_HEADER,
+    PENDING_JOB_STATUSES,
     RESPONSE_FORMATS,
+    RETRY_AFTER_HEADER,
     RETRYABLE_CODES,
     SERVED_LANGUAGE,
     SYNC_ACCEPTANCE_AMBIGUOUS_CODES,
@@ -92,7 +95,6 @@ from ._uploads import (
 from ._version import __version__
 
 _SIZE_REFUSAL_CODES = {None, *SYNC_CAP_FALLBACK_CODES}
-_PENDING_STATUSES = ("queued", "processing")
 _SECONDS = re.compile(r"[0-9]+(?:\.[0-9]*)?|\.[0-9]+")
 
 
@@ -184,6 +186,8 @@ class _Call:
     job_id: str | None = None
     request_id: str | None = None
     last_status: str | None = None
+    observed_status: str | None = None
+    observed_since: float | None = None
     file_released: threading.Event | None = None
     read_idle: threading.Event | None = None
     # True when the caller supplied the key of a submitting call, False when the SDK
@@ -375,11 +379,11 @@ class Core:
         return token if token is not None and self._api_key not in token else None
 
     def _retry_after(self, response: httpx.Response) -> float:
-        for name, scale in (("retry-after-ms", 1000.0), ("retry-after", 1.0)):
+        for name, scale in (("retry-after-ms", 1000.0), (RETRY_AFTER_HEADER, 1.0)):
             seconds = _seconds(response.headers.get(name), scale)
             if seconds is not None:
                 return seconds
-        value = response.headers.get("retry-after", "")
+        value = response.headers.get(RETRY_AFTER_HEADER, "")
         try:
             return max(0.0, parsedate_to_datetime(value).timestamp() - self._wall_clock())
         except (ValueError, TypeError, OverflowError):
@@ -532,6 +536,8 @@ class Core:
                     raise httpx.ReadTimeout("Poll request timeout exceeded")
 
             exchange = Send(request, body, min(cap, call.remaining()), expired, check, storage)
+            started = self._clock()
+            phase = call.phase
             try:
                 response = yield exchange
             except (httpx.NetworkError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
@@ -579,6 +585,14 @@ class Core:
                                 call.upload_id = upload_id
                             if data.get("state") == "bound" and upload_id == call.upload_id:
                                 self._queued(call, data.get("job_id"))
+                size = (
+                    body.body.size
+                    if isinstance(body, UploadBody)
+                    and response is not None
+                    and 200 <= response.status_code < 300
+                    else None
+                )
+                self._log_timing(call, phase, started, size=size)
             if error is None:
                 assert response is not None
                 if response.status_code < 300 or (storage and response.status_code == 412):
@@ -638,6 +652,32 @@ class Core:
             yield from self._wait(call, delay)
         raise AssertionError("Unreachable retry state")
 
+    def _log_timing(
+        self, call: _Call, phase: str, started: float, *, size: int | None = None
+    ) -> None:
+        seconds = self._clock() - started
+        transfer = ""
+        if size is not None:
+            megabytes = size / 1_000_000
+            rate = f"{megabytes / seconds:.2f} MB/s" if seconds > 0 else "rate unavailable"
+            transfer = f" {size} bytes {megabytes:.1f} MB ({rate})"
+        logger.info(
+            "%s %.1fs%s request_id=%s job_id=%s",
+            phase,
+            seconds,
+            transfer,
+            call.request_id,
+            call.job_id,
+        )
+
+    def _observe_job(self, call: _Call, status: str) -> None:
+        if status == call.observed_status:
+            return
+        if call.observed_status in PENDING_JOB_STATUSES and call.observed_since is not None:
+            self._log_timing(call, "job " + call.observed_status, call.observed_since)
+        call.observed_status = status
+        call.observed_since = self._clock()
+
     def _descriptor(self, data: dict[str, object], label: str) -> bytes:
         body = json.dumps(data, separators=(",", ":")).encode()
         if len(body) > self.limits.descriptor_bytes:
@@ -651,7 +691,7 @@ class Core:
                 "POST",
                 path,
                 body=body,
-                headers={"Content-Type": "application/json", "Idempotency-Key": key},
+                headers={"Content-Type": "application/json", IDEMPOTENCY_KEY_HEADER: key},
             )
         )
 
@@ -852,11 +892,15 @@ class Core:
         self, model: str, language: str | None, response_format: ResponseFormat
     ) -> dict[str, str]:
         if response_format not in RESPONSE_FORMATS:
-            raise ValueError("response_format must be json, text, or verbose_json")
+            raise ValueError(
+                "response_format must be one of: " + ", ".join(sorted(RESPONSE_FORMATS))
+            )
         fields = {"model": model, "response_format": response_format}
         if language is not None:
             if language.lower().split("-", 1)[0] != SERVED_LANGUAGE:
-                raise ValueError("Only English language hints are supported")
+                raise ValueError(
+                    f"language must be {SERVED_LANGUAGE!r} or a {SERVED_LANGUAGE}-* tag"
+                )
             fields["language"] = language
         return fields
 
@@ -923,18 +967,14 @@ class Core:
         if snapshot.id != call.job_id:
             raise invalid
         call.last_status = self._safe_token(snapshot.status)
+        self._observe_job(call, snapshot.status)
         call.remaining()
         if snapshot.status == "error":
             raise self._error(response, terminal=True)
         return (snapshot, response)
 
     def _poll(self, call: _Call, response_format: ResponseFormat) -> Flow[TranscriptionResult]:
-        """Poll until completion, treating every status other than queued or processing as final.
-
-        Statuses the service adds later are terminal states, so polling stops instead of
-        continuing until the deadline. Otherwise only the call deadline, enforced by
-        _wait, or an explicit max_polls ends polling.
-        """
+        """Poll with the stopping and recovery rules in api.md#retrypolicy."""
         observed: str | None = None
         cap = self.retry_policy.max_polls
         for _ in itertools.count() if cap is None else range(cap):
@@ -950,7 +990,7 @@ class Core:
                         status_code=response.status_code,
                     )
                 return self._result(call, result, response_format, response.status_code)
-            if data.status not in _PENDING_STATUSES:
+            if data.status not in PENDING_JOB_STATUSES:
                 status = call.last_status
                 raise TerminalJobError(
                     f"Transcription job ended with status {status}"
@@ -1037,13 +1077,19 @@ class Core:
                 unaccepted = refusal.code in SYNC_FALLBACK_CODES
                 if not (sized or unaccepted):
                     raise refusal
+                logger.info(
+                    "sync_submit fallback to job reason_code=%s request_id=%s job_id=%s",
+                    refusal.code,
+                    call.request_id,
+                    call.job_id,
+                )
             call.phase = "job_submit"
             response = yield from self._request(
                 call,
                 "POST",
                 "/transcription_jobs",
                 body=body,
-                headers={**body.headers, "Idempotency-Key": call.operation_key},
+                headers={**body.headers, IDEMPOTENCY_KEY_HEADER: call.operation_key},
             )
             self._accept(call, response)
         except BaseException:

@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import BinaryIO
 
-from ._contract import SUPPORTED_MEDIA_SUFFIXES
+from ._contract import CONTENT_MD5_HEADER, IDEMPOTENCY_KEY_HEADER, SUPPORTED_MEDIA_SUFFIXES
 
 FileContent = str | os.PathLike[str] | bytes | BinaryIO
 FileInput = (
@@ -38,8 +38,8 @@ _SENSITIVE_HEADERS = {
 _RESERVED = (_SENSITIVE_HEADERS - {"cookie", "cookie2", "proxy-authorization"}) | {
     "content-length",
     "content-type",
-    "idempotency-key",
-    "x-content-md5",
+    IDEMPOTENCY_KEY_HEADER.lower(),
+    CONTENT_MD5_HEADER.lower(),
 }
 
 

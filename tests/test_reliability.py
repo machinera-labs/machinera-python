@@ -159,7 +159,7 @@ def test_multipart_fields_reject_framing_characters(field: str, bad: str) -> Non
     fields = {"model": MODEL, field: bad}
     with client(lambda r: requests.append(r)) as sdk:
         with pytest.raises(
-            ValueError, match="controls or quotes" if field == "model" else "English"
+            ValueError, match="controls or quotes" if field == "model" else "language must be"
         ):
             sdk.transcribe_file(io.BytesIO(b"audio"), **fields, content_type="audio/wav")
     assert requests == []

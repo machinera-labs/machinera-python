@@ -81,7 +81,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     submission = commands.add_parser("submit")
     submission.add_argument("url")
-    submission.add_argument("--deadline", type=float, default=5.0)
+    submission.add_argument(
+        "--deadline", type=float, default=5.0, help="Wait budget in seconds (default: %(default)s)"
+    )
     commands.add_parser("resume")
     commands.add_parser("status")
     args = parser.parse_args(argv)

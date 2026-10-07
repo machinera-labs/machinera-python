@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.2.2 — 2026-10-07
+
+### Fixed
+
+- Derive protocol headers, polling states, and validation guidance from the public contract.
+- Correct upload recovery documentation and display submit deadline defaults in example help.
+- Publish the distribution tested by CI and check exact runtime dependency lower bounds.
+- Keep install instructions unpinned and reject stale
+  previous-release references outside the changelog during release checks.
+- Add a version-bump helper that updates the package version and changelog before
+  checking release sources.
+
+### Added
+
+- Opt-in phase timings through `MACHINERA_LOG=info` or `debug` for both clients,
+  including upload MB/s, observed queued and processing durations, sync
+  fallback reasons, and total call time.
+
 ## 0.2.1
 
 - Restore automatic job fallback for synchronous refusals `4002`, `4005`, `4006`, and `4008`, regardless of retry guidance.
