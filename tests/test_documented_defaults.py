@@ -23,6 +23,7 @@ from machinera._contract import (
     DEFAULT_MULTIPART_CAP_BYTES,
     DEFAULT_RESULT_RETENTION_S,
     ERROR_CODES,
+    SYNC_ACCEPTANCE_AMBIGUOUS_CODES,
 )
 from machinera._exceptions import SYNC_FALLBACK_CODES, SYNC_REPLAYABLE_CODES
 from machinera._files import _MIME_SUFFIXES, _RESERVED
@@ -764,10 +765,13 @@ def test_reference_lists_match_the_sdk() -> None:
     assert {name.lower() for name in headers} == _RESERVED
     assert listed(REFERENCE, "the recognized types are", "Without a type") == set(_MIME_SUFFIXES)
     replayable = listed(REFERENCE, "proving the request did not run (", ")")
-    assert {int(code) for code in replayable} == SYNC_REPLAYABLE_CODES
+    assert {int(code) for code in replayable} == SYNC_REPLAYABLE_CODES - SYNC_FALLBACK_CODES
     assert {
-        int(code) for code in listed(REFERENCE, "except the job-fallback refusals (", ")")
+        int(code) for code in listed(REFERENCE, "exclude the job-fallback refusals (", ")")
     } == SYNC_FALLBACK_CODES
+    assert {
+        int(code) for code in listed(REFERENCE, "and acceptance-ambiguous codes (", ")")
+    } == SYNC_ACCEPTANCE_AMBIGUOUS_CODES
 
 
 def test_every_export_has_reference_entry() -> None:
@@ -1057,7 +1061,7 @@ def test_readme_worth_retrying_matches_ordered_failure_rows(
         4: "treat it as failed for this input",
         5: "repeat the call as made",
         6: "Repeat the identical call",
-        7: "Permanent for this input, including a non-transient 4xx with `job_id` set",
+        7: "Other errors are permanent for this input, including a non-transient 4xx",
     }
     for number, cells in enumerate(rows, 1):
         assert cells[1].startswith(conditions[number])

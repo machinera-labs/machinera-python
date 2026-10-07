@@ -1,5 +1,5 @@
 """Generated service contract; do not edit."""
-# contract-sha256: c5cefb4e18ffa01eb98dfa586db7cb83cda2d8208acc7e30fb8039939357e7be
+# contract-sha256: 173cee2f13f016d05db9520b57c1bfb1e5817f2f6da99f85303f604344fd2c59
 
 from collections.abc import Mapping
 from typing import NamedTuple
@@ -116,7 +116,9 @@ UPLOADS_UNAVAILABLE_CODES: frozenset[int] = frozenset({5001})
 
 SYNC_CAP_FALLBACK_CODES: frozenset[int] = frozenset({1021, 1022})
 
-SYNC_FALLBACK_CODES: frozenset[int] = frozenset({4008})
+SYNC_FALLBACK_CODES: frozenset[int] = frozenset({4002, 4005, 4006, 4008})
+
+SYNC_ACCEPTANCE_AMBIGUOUS_CODES: frozenset[int] = frozenset({4003, 4007})
 
 UPLOAD_INCOMPLETE_CODES: frozenset[int] = frozenset({1002})
 
@@ -136,14 +138,6 @@ DEFAULT_RESULT_RETENTION_S: int = 259200
 
 DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S: int = 86400
 
-UPLOAD_GRANT_STATES: tuple[str, ...] = ("pending", "bound", "expired")
-
-IDEMPOTENCY_KEY_HEADER: str = "Idempotency-Key"
-
-CONTENT_MD5_HEADER: str = "X-Content-MD5"
-
-RETRY_AFTER_HEADER: str = "Retry-After"
-
 SUPPORTED_MEDIA_SUFFIXES: frozenset[str] = frozenset(
     {"flac", "m4a", "mp3", "mp4", "mpeg", "mpga", "ogg", "wav", "webm"}
 )
@@ -158,9 +152,15 @@ DEFERRED_TIMESTAMP_GRANULARITIES: frozenset[str] = frozenset({"segment"})
 
 SERVED_LANGUAGE: str = "en"
 
-DEFAULT_SYNC_CAP_BYTES: int = 26214400
+UPLOAD_GRANT_STATES: tuple[str, ...] = ("pending", "bound", "expired")
 
-MAX_DESCRIPTOR_BYTES: int = 65536
+IDEMPOTENCY_KEY_HEADER: str = "Idempotency-Key"
+
+CONTENT_MD5_HEADER: str = "X-Content-MD5"
+
+RETRY_AFTER_HEADER: str = "Retry-After"
+
+DEFAULT_SYNC_CAP_BYTES: int = 26214400
 
 MAX_BATCH_SUBMISSIONS: int = 64
 
@@ -169,5 +169,7 @@ MAX_BATCH_BODY_BYTES: int = 4195328
 MAX_BATCH_DESCRIPTOR_BYTES: int = 65536
 
 MAX_BATCH_STATUSES: int = 300
+
+MAX_DESCRIPTOR_BYTES: int = 65536
 
 DEFAULT_MULTIPART_CAP_BYTES: int = 99614720

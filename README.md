@@ -92,14 +92,12 @@ only the SDK's choice, never the service's limits.
 - **Latency:** a synchronous request returns in one round trip. A durable job adds
   submission, waiting to start, and polling (every `RetryPolicy.poll_interval`, 1 second by
   default).
-- **Automatic fallback:** when the synchronous route refuses an unkeyed request before
-  doing any work (too large, or no capacity right now), `"auto"` submits the same body
-  once as a durable job under an SDK-generated key; `result.job_id` is then set.
-- **Duplicate charges:** if an unkeyed synchronous request fails after its body was sent,
-  it may already have run and been billed. With the default `sync_replay="never"` the
-  SDK does not replay it: a lost response raises `AmbiguousSubmissionError`. With
-  `Machinera(sync_replay="always")` the SDK replays it under the normal retry policy, so
-  a call may be billed twice. Keyed calls and durable jobs never have this trade-off.
+- **Automatic fallback:** see the API reference for
+  [sync-to-job fallback conditions](https://github.com/machinera-labs/machinera-python/blob/main/api.md#transcribe_file).
+- **Duplicate charges:** an unkeyed synchronous request may already have run and been
+  billed when it fails. See [synchronous replay](https://github.com/machinera-labs/machinera-python/blob/main/api.md#synchronous-replay)
+  for replay eligibility and [failure handling](https://github.com/machinera-labs/machinera-python/blob/main/api.md#failure-handling)
+  for caller recovery guidance.
 - **Unkeyed durable jobs are new submissions:** `transcribe_url` and every durable job
   without `idempotency_key` get a fresh random key, so repeating such a call submits and
   bills a new job. Retry durable-job calls only under a key, as the

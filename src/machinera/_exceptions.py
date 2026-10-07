@@ -3,7 +3,12 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from ._contract import SYNC_FALLBACK_CODES, SYNC_REPLAYABLE_CODES, UPLOAD_EXPIRED_CODES
+from ._contract import (
+    SYNC_ACCEPTANCE_AMBIGUOUS_CODES,
+    SYNC_FALLBACK_CODES,
+    SYNC_REPLAYABLE_CODES,
+    UPLOAD_EXPIRED_CODES,
+)
 
 
 def retry_eligible(
@@ -14,28 +19,18 @@ def retry_eligible(
     replay_after_send: bool = False,
     guidance: bool | None = None,
 ) -> bool:
-    """Whether a received error response may be retried; the retry loop and is_transient agree.
-
-    replay_after_send (sync_replay="always") also replays a synchronous request after any
-    retryable response, and after any 5xx unless the service's own guidance is False,
-    except the job-fallback codes, whose handling it leaves unchanged. guidance is the
-    explicit retryable flag in the response, or None when it carried none.
-    """
+    """Classify status retries; see api.md#synchronous-replay and api.md#machineraerror."""
+    if not replay_safe and (code in SYNC_FALLBACK_CODES or code in SYNC_ACCEPTANCE_AMBIGUOUS_CODES):
+        return False
     if (
         replay_after_send
         and not replay_safe
         and status is not None
         and 500 <= status < 600
         and guidance is not False
-        and code not in SYNC_FALLBACK_CODES
     ):
         return True
-    replayable = (
-        replay_safe
-        or status == 429
-        or code in SYNC_REPLAYABLE_CODES
-        or (replay_after_send and code not in SYNC_FALLBACK_CODES)
-    )
+    replayable = replay_safe or status == 429 or code in SYNC_REPLAYABLE_CODES or replay_after_send
     return replayable and retryable is True and status not in (401, 403)
 
 

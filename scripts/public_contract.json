@@ -537,7 +537,14 @@
       1022
     ],
     "SYNC_FALLBACK_CODES": [
+      4002,
+      4005,
+      4006,
       4008
+    ],
+    "SYNC_ACCEPTANCE_AMBIGUOUS_CODES": [
+      4003,
+      4007
     ],
     "UPLOAD_INCOMPLETE_CODES": [
       1002
@@ -573,14 +580,6 @@
     ],
     "DEFAULT_RESULT_RETENTION_S": 259200,
     "DEFAULT_IDEMPOTENCY_REPLAY_WINDOW_S": 86400,
-    "UPLOAD_GRANT_STATES": [
-      "pending",
-      "bound",
-      "expired"
-    ],
-    "IDEMPOTENCY_KEY_HEADER": "Idempotency-Key",
-    "CONTENT_MD5_HEADER": "X-Content-MD5",
-    "RETRY_AFTER_HEADER": "Retry-After",
     "SUPPORTED_MEDIA_SUFFIXES": [
       "flac",
       "m4a",
@@ -608,12 +607,20 @@
       "segment"
     ],
     "SERVED_LANGUAGE": "en",
+    "UPLOAD_GRANT_STATES": [
+      "pending",
+      "bound",
+      "expired"
+    ],
+    "IDEMPOTENCY_KEY_HEADER": "Idempotency-Key",
+    "CONTENT_MD5_HEADER": "X-Content-MD5",
+    "RETRY_AFTER_HEADER": "Retry-After",
     "DEFAULT_SYNC_CAP_BYTES": 26214400,
-    "MAX_DESCRIPTOR_BYTES": 65536,
     "MAX_BATCH_SUBMISSIONS": 64,
     "MAX_BATCH_BODY_BYTES": 4195328,
     "MAX_BATCH_DESCRIPTOR_BYTES": 65536,
     "MAX_BATCH_STATUSES": 300,
+    "MAX_DESCRIPTOR_BYTES": 65536,
     "DEFAULT_MULTIPART_CAP_BYTES": 99614720
   }
 }

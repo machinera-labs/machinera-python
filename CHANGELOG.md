@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.1
+
+- Restore automatic job fallback for synchronous refusals `4002`, `4005`, `4006`, and `4008`, regardless of retry guidance.
+- Never replay `4003`/`4007`; preserve recovery identity and direct callers to support before resubmitting.
+
 ## 0.2.0 — 2026-10-06
 
 ### Breaking

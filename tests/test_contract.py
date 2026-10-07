@@ -348,7 +348,7 @@ def owned(
                 retryable=True,
                 phase="sync_submit",
             ),
-            True,
+            False,
         ),
         (
             m.InternalServerError(
@@ -412,7 +412,7 @@ def owned(
                 False,
                 replay=True,
             ),
-            True,
+            False,
         ),
     ],
 )

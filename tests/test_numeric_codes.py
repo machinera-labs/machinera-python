@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from uuid import UUID
 
 import httpx
 import pytest
@@ -20,49 +21,163 @@ from support import (
 )
 
 import machinera as m
+from machinera import _core
 from machinera._contract import (
     ERROR_CODES,
+    SYNC_ACCEPTANCE_AMBIGUOUS_CODES,
     SYNC_CAP_FALLBACK_CODES,
     SYNC_FALLBACK_CODES,
-    SYNC_REPLAYABLE_CODES,
     UPLOAD_GRANT_STATES,
 )
 from machinera._uploads import Grant
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("code", sorted(SYNC_FALLBACK_CODES | SYNC_CAP_FALLBACK_CODES))
-def test_numeric_sync_to_job_fallback_acceptance(code: int, asynchronous: bool) -> None:
+@pytest.mark.parametrize("policy", ["never", "always"])
+@pytest.mark.parametrize("retryable", [True, False, None])
+@pytest.mark.parametrize("code", sorted(SYNC_FALLBACK_CODES))
+def test_numeric_sync_to_job_fallback_acceptance(
+    code: int,
+    retryable: bool | None,
+    policy: str,
+    asynchronous: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[httpx.Request] = []
+    clock = Clock()
+    operation_key = UUID("12345678-1234-5678-1234-567812345678")
+    monkeypatch.setattr(_core.uuid, "uuid4", lambda: operation_key)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path.endswith("/audio/transcriptions"):
+            error = {"code": code}
+            if retryable is not None:
+                error["retryable"] = retryable
+            return httpx.Response(
+                ERROR_CODES[code].status,
+                json={"error": error},
+                headers={"Retry-After": "0"},
+            )
+        return accepted() if request.method == "POST" else completed()
+
+    with client(handler, clock, asynchronous=asynchronous, sync_replay=policy) as sdk:
+        output = sdk.transcribe_file(b"fLaC", model=MODEL)
+    assert [(request.method, request.url.path) for request in calls] == [
+        ("POST", "/v1/audio/transcriptions"),
+        ("POST", "/v1/transcription_jobs"),
+        ("GET", "/v1/transcription_jobs/job-1"),
+    ]
+    assert output.job_id == "job-1"
+    assert output.text == "  exact\ntext  "
+    assert calls[0].content == calls[1].content
+    assert calls[1].headers["idempotency-key"] == operation_key.hex
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("code", sorted(SYNC_CAP_FALLBACK_CODES))
+def test_numeric_size_refusal_falls_back_to_job(code: int, asynchronous: bool) -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path.endswith("/audio/transcriptions"):
+            return httpx.Response(ERROR_CODES[code].status, json={"error": {"code": code}})
+        return accepted() if request.method == "POST" else completed()
+
+    with client(handler, asynchronous=asynchronous) as sdk:
+        output = sdk.transcribe_file(b"fLaC", model=MODEL)
+    assert [request.url.path for request in calls] == [
+        "/v1/audio/transcriptions",
+        "/v1/transcription_jobs",
+        "/v1/transcription_jobs/job-1",
+    ]
+    assert output.job_id == "job-1"
+    assert calls[0].content == calls[1].content
+    assert calls[1].headers["idempotency-key"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("code", sorted(SYNC_FALLBACK_CODES))
+def test_fallback_gate_never_reads_retryable(
+    code: int,
+    asynchronous: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Refusal(m.InternalServerError):
+        def __getattribute__(self, name: str) -> object:
+            if name == "retryable":
+                pytest.fail("The fallback gate must not read retryable")
+            return super().__getattribute__(name)
+
+    original = _core.Core._request
+    calls: list[httpx.Request] = []
+    operation_keys: list[str] = []
+
+    def request(self, call, method, path, **kwargs):
+        if path == "/audio/transcriptions":
+            operation_keys.append(call.operation_key)
+            raise Refusal("refused", code=code, status_code=ERROR_CODES[code].status)
+        return (yield from original(self, call, method, path, **kwargs))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return accepted() if request.method == "POST" else completed()
+
+    monkeypatch.setattr(_core.Core, "_request", request)
+    with client(handler, asynchronous=asynchronous) as sdk:
+        assert sdk.transcribe_file(b"fLaC", model=MODEL).text == "  exact\ntext  "
+    assert [(request.method, request.url.path) for request in calls] == [
+        ("POST", "/v1/transcription_jobs"),
+        ("GET", "/v1/transcription_jobs/job-1"),
+    ]
+    assert [calls[0].headers["idempotency-key"]] == operation_keys
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("policy", ["never", "always"])
+@pytest.mark.parametrize("retryable", [True, False, None])
+@pytest.mark.parametrize("code", sorted(SYNC_ACCEPTANCE_AMBIGUOUS_CODES))
+def test_ambiguous_sync_acceptance_never_replays_or_falls_back(
+    code: int,
+    retryable: bool | None,
+    policy: str,
+    asynchronous: bool,
+) -> None:
     calls: list[httpx.Request] = []
     clock = Clock()
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
-        if request.url.path.endswith("/audio/transcriptions"):
-            entry = ERROR_CODES[code]
-            return httpx.Response(
-                entry.status,
-                json={"error": {"code": code, "retryable": entry.retryable}},
-                headers={"Retry-After": "0"},
-            )
-        return accepted() if request.method == "POST" else completed()
+        error = {"code": code}
+        if retryable is not None:
+            error["retryable"] = retryable
+        return httpx.Response(
+            ERROR_CODES[code].status,
+            json={"error": error},
+            headers={"x-request-id": "request-ambiguous"},
+        )
 
-    with client(handler, clock, asynchronous=asynchronous) as sdk:
-        output = sdk.transcribe_file(b"fLaC", model=MODEL)
-    sync_count = m.RetryPolicy().max_attempts if code in SYNC_REPLAYABLE_CODES else 1
-    assert [request.url.path for request in calls] == [
-        *(["/v1/audio/transcriptions"] * sync_count),
-        "/v1/transcription_jobs",
-        "/v1/transcription_jobs/job-1",
+    with client(handler, clock, asynchronous=asynchronous, sync_replay=policy) as sdk:
+        with pytest.raises(m.InternalServerError) as caught:
+            sdk.transcribe_file(b"fLaC", model=MODEL)
+    error = caught.value
+    assert [(request.method, request.url.path) for request in calls] == [
+        ("POST", "/v1/audio/transcriptions"),
     ]
-    assert output.job_id == "job-1"
-    assert all(request.content == calls[-2].content for request in calls[:sync_count])
-    assert calls[-2].headers["idempotency-key"]
-    assert clock.sleeps == ([0.4375, 0.875] if sync_count == 3 else [])
+    assert clock.sleeps == []
+    assert error.code == code
+    assert error.is_transient is False
+    assert error.job_id is None
+    assert error.phase == "sync_submit"
+    assert error.request_id == "request-ambiguous"
+    assert error.operation_key
+    assert "contact support before resubmitting" in str(error)
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("code", [4005, 4006, 4020])
+@pytest.mark.parametrize("code", [4020])
 def test_current_nonretryable_refusals_do_not_retry_or_fallback(
     code: int, asynchronous: bool
 ) -> None:

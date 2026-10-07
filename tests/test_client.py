@@ -727,7 +727,7 @@ def test_auto_sync_acceptance_refusal_falls_back_to_job(
     sync = [r for r in requests if r.url.path == "/v1/audio/transcriptions"]
     submit = [r for r in requests if r.url.path == "/v1/transcription_jobs"]
     assert output.job_id == "job-1" and len(submit) == 1
-    assert len(sync) == (1 if code == 4006 else RetryPolicy().max_attempts)
+    assert len(sync) == 1
     assert all(r.content == submit[0].content for r in sync)
     assert submit[0].headers["idempotency-key"]
     assert requests[-1].url.path == "/v1/transcription_jobs/job-1"
@@ -770,7 +770,7 @@ def lost(_: httpx.Request) -> httpx.Response:
 @pytest.mark.parametrize(
     "handler,kind",
     [
-        (lambda _: refused(4006, retryable=False), InternalServerError),
+        (lambda _: refused(4007, retryable=False), InternalServerError),
         (lambda _: refused(4009), InternalServerError),
         (lost, AmbiguousSubmissionError),
     ],

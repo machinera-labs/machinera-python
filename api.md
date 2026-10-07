@@ -109,9 +109,12 @@ did not mark `retryable: false`.
 | `"always"` | Replays the identical request under `RetryPolicy.max_attempts`, the same backoff, and the call deadline. Exhausted attempts raise the last `APIConnectionError`, `APITimeoutError`, or status error with `is_transient` `True`; an expired deadline raises `DeadlineExceededError`. A replayed request may run and be billed more than once. |
 
 A 5xx marked `retryable: false` and other non-retryable responses are never replayed.
-The [job-fallback refusals](#transcribe_file) use their eligible synchronous retries
-before falling back. Keyed calls, durable jobs, polling, uploads, and the auto-mode
-job fallback are unaffected.
+The [job-fallback refusals](#transcribe_file) immediately submit as a job without
+replaying the synchronous request, regardless of `retryable`. Codes `4003`/`4007`
+never replay or fall back, even with `"always"`: processing may have started.
+These errors have `is_transient=False`; retain `request_id` and `operation_key`
+and contact support before resubmitting. Keyed calls, durable jobs, polling,
+and uploads are unaffected.
 
 #### Timeout forms and precedence
 
@@ -334,9 +337,12 @@ With `transport="auto"`, an unkeyed synchronous request the service refuses befo
 starting any work is submitted once as a durable job instead, with the same encoded
 body, operation key, deadline, and limits; `phase` becomes `"job_submit"`. This
 applies to a size refusal (HTTP 413 without a code, `1021`, or
-`1022`) and, after any eligible synchronous retries, to the retryable
-pre-execution refusal `4008` when the service has not marked it non-retryable. A response
-lost after sending, any other failure, and `transport="job"` never take this path.
+`1022`) and to refusals `4002`, `4005`, `4006`, or `4008`, regardless of `retryable`.
+The job POST uses the call’s existing operation key as its `Idempotency-Key`.
+Codes `4003`/`4007` may indicate work already started: no job fallback or replay
+is attempted, and `is_transient` is `False`. Save `request_id` and `operation_key`
+and contact support before resubmitting; a new submission can duplicate charges.
+A response lost after sending, any other failure, and `transport="job"` never take this path.
 
 Raises the common operation exceptions below, plus `PayloadTooLargeError` for
 service upload or local descriptor size limits, `ValueError` for invalid input values or simultaneous use of
@@ -903,7 +909,7 @@ prove a request was sent. For accepted jobs, follow row 3 of
 | `APIConnectionError` from local file I/O or a closed client | `False` |
 | Other `APIConnectionError`, including `APITimeoutError` | `True` unless `retryable` is `False`; in the `"sync_submit"` phase only when `retryable` is `True`: nothing was sent, or `sync_replay="always"` replayed a request that failed after sending |
 | `AuthenticationError`, `PermissionDeniedError` | `False` |
-| Other `APIStatusError`, including `RateLimitError` and `InternalServerError` | `True` only when `retryable` is `True` (see [retryable precedence](#retryable-precedence)); in the `"sync_submit"` phase additionally only for HTTP 429, a refusal code proving the request did not run (`4001`, `4008`, `4018`, `4019`, or `4021`), or, with `sync_replay="always"`, any code except the job-fallback refusals (`4008`). With `sync_replay="always"`, a `"sync_submit"` 5xx is also `True` whatever `retryable` is, unless the service sent `retryable: false` or a job-fallback code |
+| Other `APIStatusError`, including `RateLimitError` and `InternalServerError` | `True` only when `retryable` is `True` (see [retryable precedence](#retryable-precedence)); in the `"sync_submit"` phase additionally only for HTTP 429, a replayable refusal code proving the request did not run (`4001`, `4018`, `4019`, or `4021`), or, with `sync_replay="always"`, any other code. Synchronous errors always exclude the job-fallback refusals (`4002`, `4005`, `4006`, `4008`) and acceptance-ambiguous codes (`4003`, `4007`). With `sync_replay="always"`, a `"sync_submit"` 5xx is also `True` whatever `retryable` is, unless the service sent `retryable: false` or one of these excluded codes |
 | Anything else, including `AmbiguousSubmissionError`, `UploadError`, and `APIResponseValidationError` | `False` |
 
 ### `RecoverableJobError`
@@ -1024,7 +1030,7 @@ Other unsuccessful HTTP statuses use `APIStatusError` directly.
 | 4 | `AmbiguousSubmissionError` | An unkeyed synchronous request may have run (default `sync_replay="never"` only), and no SDK call can tell whether it did. Repeating it, with or without a key, may bill it again, so treat it as failed for this input unless a second charge is acceptable. A key on every call avoids this case. |
 | 5 | `RecoverableJobError` (`DeadlineExceededError`) without `job_id`, or a lost job submission: an `APIConnectionError` or status error with `retryable` `True`, without `job_id`, in `phase` `"job_submit"` or `"submit"`; also a deadline or retryable connection/status error in a file upload after key rotation | By `phase`: `"prepare"` or `"concurrency_wait"`: nothing was sent; repeat the call as made. `"sync_submit"`: row 4 under the default, or repeat the call under `sync_replay="always"`. Any file upload after key rotation: continue with the current key and upload ID through file `resume(...)`. Any other phase: when `is_transient` is `True` (see the [`is_transient` table](https://github.com/machinera-labs/machinera-python/blob/main/api.md#machineraerror)), repeat the call as made; otherwise, for a file upload, use `resume(file=..., model=..., operation_key=error.operation_key, upload_id=error.upload_id)` with identical options. For a URL or multipart input, repeat with `idempotency_key=error.operation_key`. These continuations replay the job if it was accepted, because a lost submission's job may have been accepted and repeating the call as made could submit and bill a second one. |
 | 6 | Any other error with `is_transient` `True` | Repeat the identical call, with the same key, after a pause. The SDK has already retried it. |
-| 7 | Anything else (`is_transient` `False`) | Permanent for this input, including a non-transient 4xx with `job_id` set on either the initial call or `resume`, except for the [caller-keyed recovery exception](https://github.com/machinera-labs/machinera-python/blob/main/api.md#machineraerror). This covers `AuthenticationError`, `PermissionDeniedError`, `BadRequestError`, `UnprocessableEntityError`, `PayloadTooLargeError`, `NotFoundError`, `ConflictError`, `UploadError` and `IntegrityError`, a status error that `is_transient` does not make transient (a bare 500 under the default `sync_replay="never"`, for example), a 5xx on the synchronous route under that default (it may have run; see row 4), and `APIConnectionError` from a closed client, from local file I/O such as a missing path, or with `retryable` `False`. Record the class name, `code`, and `request_id`. A new key is a new submission and a new charge. |
+| 7 | Anything else (`is_transient` `False`) | For synchronous codes `4003`/`4007`, processing may have started: save `request_id` and `operation_key` and contact support before resubmitting, even with `sync_replay="always"`. Other errors are permanent for this input, including a non-transient 4xx with `job_id` set on either the initial call or `resume`, except for the [caller-keyed recovery exception](https://github.com/machinera-labs/machinera-python/blob/main/api.md#machineraerror). This covers `AuthenticationError`, `PermissionDeniedError`, `BadRequestError`, `UnprocessableEntityError`, `PayloadTooLargeError`, `NotFoundError`, `ConflictError`, `UploadError` and `IntegrityError`, a status error that `is_transient` does not make transient (a bare 500 under the default `sync_replay="never"`, for example), a 5xx on the synchronous route under that default (it may have run; see row 4), and `APIConnectionError` from a closed client, from local file I/O such as a missing path, or with `retryable` `False`. Record the class name, `code`, and `request_id`. A new key is a new submission and a new charge. |
 
 #### Retryable precedence
 

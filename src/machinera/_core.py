@@ -29,6 +29,7 @@ from ._contract import (
     RESPONSE_FORMATS,
     RETRYABLE_CODES,
     SERVED_LANGUAGE,
+    SYNC_ACCEPTANCE_AMBIGUOUS_CODES,
     SYNC_CAP_FALLBACK_CODES,
     SYNC_FALLBACK_CODES,
     UPLOAD_ERROR_CODES,
@@ -436,6 +437,11 @@ class Core:
                 if value is not None:
                     body[name] = value
         message = "Transcription job failed" if terminal else "Machinera API request failed"
+        if code in SYNC_ACCEPTANCE_AMBIGUOUS_CODES:
+            message = (
+                "Synchronous processing may have started; contact support before resubmitting. "
+                "Resubmitting can duplicate processing and charges"
+            )
         multipart_cap: int | None = None
         if code in UPLOADS_UNAVAILABLE_CODES:
             message = (
@@ -1028,7 +1034,7 @@ class Core:
                     isinstance(refusal, PayloadTooLargeError)
                     and refusal.code in _SIZE_REFUSAL_CODES
                 )
-                unaccepted = refusal.code in SYNC_FALLBACK_CODES and refusal.retryable is True
+                unaccepted = refusal.code in SYNC_FALLBACK_CODES
                 if not (sized or unaccepted):
                     raise refusal
             call.phase = "job_submit"
