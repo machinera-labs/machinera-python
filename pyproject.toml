@@ -34,7 +34,7 @@ Changelog = "https://github.com/machinera-labs/machinera-python/blob/main/CHANGE
 Issues = "https://github.com/machinera-labs/machinera-python/issues"
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=0.24,<2", "ruff", "mypy", "build", "twine"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24,<2", "ruff", "mypy", "build", "twine", "tomli; python_version < '3.11'"]
 
 [tool.hatch.version]
 path = "src/machinera/_version.py"

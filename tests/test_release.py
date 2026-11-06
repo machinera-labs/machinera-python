@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import gc
 import importlib.util
 import io
 import subprocess
 import sys
 import tarfile
+import warnings
 import zipfile
 from email.message import Message
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPHandler, HTTPSHandler, Request, build_opener
 from urllib.response import addinfourl
 
@@ -73,12 +75,18 @@ def test_release_check_runs_without_the_package_installed(tmp_path: Path) -> Non
     tracker = subprocess.run([*isolated, "-c", "import machinera"], cwd=tmp_path, check=False)
     assert tracker.returncode != 0
     distributions(tmp_path, __version__, __version__)
+    parser_path = ""
+    if sys.version_info < (3, 11):
+        import tomli
+
+        # Expose the parser backport without enabling site or SDK editable imports.
+        parser_path = f"sys.path.append({str(Path(tomli.__file__).parents[1])!r}); "
     for tag, expected in ((f"v{__version__}", 0), ("v0.0.0", 1)):
         result = subprocess.run(
             [
                 *isolated,
                 "-c",
-                "import runpy, sys; from unittest.mock import MagicMock, patch; "
+                "import runpy, sys; " + parser_path + "from unittest.mock import MagicMock, patch; "
                 "response = MagicMock(); response.__enter__.return_value.status = 200; "
                 "patch('urllib.request.urlopen', return_value=response).start(); "
                 "sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')",
@@ -193,7 +201,6 @@ def test_copy_guard_checks_identifier_parts(
         "examples/nested/data.txt",
         "scripts/tool.py",
         ".github/workflows/test.yml",
-        "uv.lock",
     ],
 )
 def test_previous_version_elsewhere_fails(
@@ -208,6 +215,54 @@ def test_previous_version_elsewhere_fails(
     with pytest.raises(ValueError, match="Previous release version 8.7.6") as caught:
         checker.check_public_sources(source_tree)
     assert f"{name}:2" in str(caught.value)
+
+
+@pytest.mark.parametrize("sdk_version", [None, "8.7.6", "8.7.5"])
+def test_previous_version_checks_only_sdk_lock_entry(
+    checker: ModuleType, source_tree: Path, sdk_version: str | None
+) -> None:
+    (source_tree / "CHANGELOG.md").write_text(f"## {__version__}\n\n## 8.7.6\n", encoding="utf-8")
+    (source_tree / "pyproject.toml").write_text(
+        '[project]\nname = "example-sdk"\n', encoding="utf-8"
+    )
+    (source_tree / "uv.lock").write_text(
+        '[[package]]\nname = "dependency"\nversion = "8.7.6"\n'
+        f'[[package]]\nname = "example-sdk"\nversion = "{sdk_version or __version__}"\n',
+        encoding="utf-8",
+    )
+    if sdk_version is None:
+        checker.check_previous_version(source_tree)
+    else:
+        with pytest.raises(ValueError, match="uv.lock: SDK package version"):
+            checker.check_previous_version(source_tree)
+
+
+@pytest.mark.parametrize(
+    ("dynamic", "sdk_entry", "valid"),
+    [
+        (True, '[[package]]\nname = "example-sdk"\nsource = { editable = "." }\n', True),
+        (False, '[[package]]\nname = "example-sdk"\n', False),
+        (True, '[[package]]\nname = "example-sdk"\nversion = "8.7.6"\n', False),
+        (True, "", False),
+    ],
+)
+def test_previous_version_checks_dynamic_sdk_lock_entry(
+    checker: ModuleType, source_tree: Path, dynamic: bool, sdk_entry: str, valid: bool
+) -> None:
+    (source_tree / "CHANGELOG.md").write_text(f"## {__version__}\n\n## 8.7.6\n", encoding="utf-8")
+    metadata = 'dynamic = ["version"]\n' if dynamic else f'version = "{__version__}"\n'
+    (source_tree / "pyproject.toml").write_text(
+        '[project]\nname = "example-sdk"\n' + metadata, encoding="utf-8"
+    )
+    (source_tree / "uv.lock").write_text(
+        '[[package]]\nname = "dependency"\nversion = "8.7.6"\n' + sdk_entry,
+        encoding="utf-8",
+    )
+    if valid:
+        checker.check_previous_version(source_tree)
+    else:
+        with pytest.raises(ValueError, match="uv.lock: SDK package version"):
+            checker.check_previous_version(source_tree)
 
 
 @pytest.mark.parametrize("previous_parts", [(0, 2, 0), (0, 2, 1)])
@@ -323,7 +378,40 @@ def test_bump_version_rejects_invalid_input_without_edits(bump_tree: Path, versi
     assert all(path.read_bytes() == content for path, content in before.items())
 
 
-@pytest.mark.parametrize("outcome", [200, 404, "redirect", "network"])
+def test_policy_http_error_is_closed_before_collection(
+    checker: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url = "https://policies.example/terms"
+    (tmp_path / "README.md").write_text(f"## Terms, privacy and acceptable use\n[Terms]({url})\n")
+    unraisable: list[str] = []
+    monkeypatch.setattr(
+        sys, "unraisablehook", lambda event: unraisable.append(str(event.exc_value))
+    )
+
+    def open_error(request: Request, timeout: int) -> None:
+        response = addinfourl(io.BytesIO(), Message(), url, 404)
+        raise HTTPError(url, 404, "Synthetic response", response.headers, response)
+
+    monkeypatch.setattr(checker, "urlopen", open_error)
+
+    def check_error() -> bool:
+        with pytest.raises(ValueError) as caught:
+            checker.check_policy_pages(tmp_path)
+        assert str(caught.value) == f"Policy page {url}: HTTP 404; expected HTTP 200"
+        cause = caught.value.__cause__
+        assert isinstance(cause, HTTPError)
+        return cause.closed
+
+    gc.collect()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ResourceWarning)
+        closed = check_error()
+        gc.collect()
+    assert not unraisable, unraisable
+    assert closed
+
+
+@pytest.mark.parametrize("outcome", [200, 204, 404, "redirect", "redirect-404", "network"])
 def test_policy_pages_use_redirecting_get(
     checker: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: int | str
 ) -> None:
@@ -334,6 +422,7 @@ def test_policy_pages_use_redirecting_get(
         + "\n## Install\n[Unrelated](https://unrelated.example/)\n"
     )
     requests: list[Request] = []
+    responses: list[addinfourl] = []
 
     class Transport(HTTPHandler, HTTPSHandler):
         def https_open(self, request: Request) -> addinfourl:
@@ -346,24 +435,32 @@ def test_policy_pages_use_redirecting_get(
             if outcome == "network":
                 raise URLError("connection unavailable")
             redirected = request.full_url.endswith("/live")
-            status = 302 if outcome == "redirect" and not redirected else outcome
-            if status == "redirect":
-                status = 200
+            if outcome in ("redirect", "redirect-404"):
+                status = (200 if outcome == "redirect" else 404) if redirected else 302
+            else:
+                status = outcome
             headers = Message()
             if status == 302:
                 headers["Location"] = request.full_url + "/live"
             response = addinfourl(io.BytesIO(), headers, request.full_url, status)
             response.msg = "Synthetic response"
+            responses.append(response)
             return response
 
         http_open = https_open
 
     monkeypatch.setattr(checker, "urlopen", build_opener(Transport()).open)
-    if outcome in (404, "network"):
+    if outcome in (204, 404, "redirect-404", "network"):
         with pytest.raises(ValueError) as caught:
             checker.check_policy_pages(tmp_path)
         assert urls[0] in str(caught.value)
-        assert ("HTTP 404" if outcome == 404 else "network error") in str(caught.value)
+        expected_error = (
+            "network error" if outcome == "network" else f"HTTP {204 if outcome == 204 else 404}"
+        )
+        assert expected_error in str(caught.value)
+        if outcome in (404, "redirect-404"):
+            assert isinstance(caught.value.__cause__, HTTPError)
+            assert caught.value.__cause__.closed
     else:
         checker.check_policy_pages(tmp_path)
         expected = (
@@ -372,6 +469,7 @@ def test_policy_pages_use_redirecting_get(
             else urls
         )
         assert [request.full_url for request in requests] == expected
+    assert all(response.closed for response in responses)
 
 
 def test_release_requires_live_policy_pages(checker: ModuleType, tmp_path: Path) -> None:

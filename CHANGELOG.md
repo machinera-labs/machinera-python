@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.2.4 — 2026-11-06
+
+0.2.4 is the first published release containing the 0.2.3 changes plus the
+release-checker cleanup fix. Version 0.2.3 was tagged publicly but never published
+to PyPI because its release CI failed on Python 3.14 due to an unclosed HTTP error
+response in the release checker.
+
+### Fixed
+
+- Close HTTP error responses during release checks.
+- Check only the SDK package version in the lockfile during release validation.
+
 ## 0.2.3 — 2026-11-05
 
 ### Added

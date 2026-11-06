@@ -14,6 +14,11 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
+
 VERSION_FILE = Path(__file__).resolve().parents[1] / "src" / "machinera" / "_version.py"
 
 
@@ -166,6 +171,24 @@ def check_previous_version(root: Path) -> None:
     for path in shipped_paths(root):
         if path == changelog:
             continue
+        if path == root / "uv.lock":
+            project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+            lock = tomllib.loads(path.read_text(encoding="utf-8"))
+            packages = [
+                package
+                for package in lock.get("package", [])
+                if package["name"] == project["project"]["name"]
+            ]
+            if len(packages) != 1:
+                raise ValueError("uv.lock: SDK package version entry must exist exactly once")
+            sdk = packages[0]
+            if "version" in sdk:
+                valid = sdk["version"] == version
+            else:
+                valid = "version" in project["project"].get("dynamic", [])
+            if not valid:
+                raise ValueError(f"uv.lock: SDK package version must equal {version}")
+            continue
         for number, line in enumerate(
             path.read_text(encoding="utf-8", errors="replace").splitlines(), 1
         ):
@@ -224,6 +247,7 @@ def check_policy_pages(root: Path = ROOT) -> None:
             with urlopen(request, timeout=5) as response:
                 status = response.status
         except HTTPError as error:
+            error.close()
             raise ValueError(f"Policy page {url}: HTTP {error.code}; expected HTTP 200") from error
         except (URLError, OSError) as error:
             raise ValueError(
