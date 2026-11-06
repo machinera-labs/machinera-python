@@ -6,8 +6,13 @@ import subprocess
 import sys
 import tarfile
 import zipfile
+from email.message import Message
 from pathlib import Path
 from types import ModuleType
+from unittest.mock import MagicMock
+from urllib.error import URLError
+from urllib.request import HTTPHandler, HTTPSHandler, Request, build_opener
+from urllib.response import addinfourl
 
 import pytest
 
@@ -17,11 +22,14 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "check_release.py"
 
 
 @pytest.fixture
-def checker() -> ModuleType:
+def checker(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     spec = importlib.util.spec_from_file_location("check_release", SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    response = MagicMock()
+    response.__enter__.return_value.status = 200
+    monkeypatch.setattr(module, "urlopen", MagicMock(return_value=response))
     return module
 
 
@@ -67,7 +75,18 @@ def test_release_check_runs_without_the_package_installed(tmp_path: Path) -> Non
     distributions(tmp_path, __version__, __version__)
     for tag, expected in ((f"v{__version__}", 0), ("v0.0.0", 1)):
         result = subprocess.run(
-            [*isolated, str(SCRIPT), tag, "--dist", str(tmp_path)],
+            [
+                *isolated,
+                "-c",
+                "import runpy, sys; from unittest.mock import MagicMock, patch; "
+                "response = MagicMock(); response.__enter__.return_value.status = 200; "
+                "patch('urllib.request.urlopen', return_value=response).start(); "
+                "sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')",
+                str(SCRIPT),
+                tag,
+                "--dist",
+                str(tmp_path),
+            ],
             cwd=tmp_path,
             capture_output=True,
             text=True,
@@ -302,3 +321,77 @@ def test_bump_version_rejects_invalid_input_without_edits(bump_tree: Path, versi
     result = run_bump(bump_tree, version)
     assert result.returncode != 0
     assert all(path.read_bytes() == content for path, content in before.items())
+
+
+@pytest.mark.parametrize("outcome", [200, 404, "redirect", "network"])
+def test_policy_pages_use_redirecting_get(
+    checker: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: int | str
+) -> None:
+    urls = [f"https://policies.example/{name}" for name in ("terms", "privacy", "acceptable-use")]
+    (tmp_path / "README.md").write_text(
+        "## Terms, privacy and acceptable use\n\n"
+        + "\n".join(f"[Policy]({url})" for url in urls)
+        + "\n## Install\n[Unrelated](https://unrelated.example/)\n"
+    )
+    requests: list[Request] = []
+
+    class Transport(HTTPHandler, HTTPSHandler):
+        def https_open(self, request: Request) -> addinfourl:
+            requests.append(request)
+            assert request.get_method() == "GET"
+            assert request.timeout == 5
+            assert request.get_header("User-agent") == (
+                f"machinera-python-release-check/{__version__}"
+            )
+            if outcome == "network":
+                raise URLError("connection unavailable")
+            redirected = request.full_url.endswith("/live")
+            status = 302 if outcome == "redirect" and not redirected else outcome
+            if status == "redirect":
+                status = 200
+            headers = Message()
+            if status == 302:
+                headers["Location"] = request.full_url + "/live"
+            response = addinfourl(io.BytesIO(), headers, request.full_url, status)
+            response.msg = "Synthetic response"
+            return response
+
+        http_open = https_open
+
+    monkeypatch.setattr(checker, "urlopen", build_opener(Transport()).open)
+    if outcome in (404, "network"):
+        with pytest.raises(ValueError) as caught:
+            checker.check_policy_pages(tmp_path)
+        assert urls[0] in str(caught.value)
+        assert ("HTTP 404" if outcome == 404 else "network error") in str(caught.value)
+    else:
+        checker.check_policy_pages(tmp_path)
+        expected = (
+            [item for url in urls for item in (url, url + "/live")]
+            if outcome == "redirect"
+            else urls
+        )
+        assert [request.full_url for request in requests] == expected
+
+
+def test_release_requires_live_policy_pages(checker: ModuleType, tmp_path: Path) -> None:
+    distributions(tmp_path, __version__, __version__)
+    checker.urlopen.side_effect = URLError("unavailable")
+    with pytest.raises(ValueError, match="Policy page .*network error"):
+        checker.check_release(f"v{__version__}", tmp_path)
+
+
+def test_source_only_does_not_fetch_policy_pages(
+    checker: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checker.urlopen.side_effect = AssertionError("unexpected network request")
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--source-only"])
+    checker.main()
+    checker.urlopen.assert_not_called()
+
+
+def test_missing_policy_links_fail_closed(checker: ModuleType, tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("# SDK\n")
+    with pytest.raises(ValueError, match="README policy links are missing"):
+        checker.check_policy_pages(tmp_path)
+    checker.urlopen.assert_not_called()

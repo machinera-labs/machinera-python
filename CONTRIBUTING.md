@@ -13,6 +13,10 @@ clone your fork, and create a branch for the change. See
 [`.python-version`](.python-version) for the development Python version,
 [`ci.yml`](.github/workflows/ci.yml) for what CI runs, and
 [`publish.yml`](.github/workflows/publish.yml) for when it runs before publication.
+Use a uv version satisfying `tool.uv.required-version` in
+[`pyproject.toml`](pyproject.toml). CI reads the same requirement, including when
+invoked by the publication workflow. This minimum
+aligns development tooling with the writer of lockfile revision 5.
 Run `uv run ruff check . && uv run ruff format --check . &&
 uv run mypy --strict src && uv run pytest -q` locally before asking for review.
 
@@ -73,6 +77,9 @@ process, so a contribution may appear in a later release without a direct merge 
 the original pull request.
 
 ## Release maintenance
+
+The README policy pages must be live before a release: `scripts/check_release.py`
+requires HTTP 200 after redirects for every policy link unless `--source-only` is used.
 
 Review `api.md` against the exported API at every release (tests check that every
 export has an entry) and check examples on the supported Python matrix. Use

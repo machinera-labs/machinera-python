@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.2.3 — 2026-11-05
+
+### Added
+
+- Link terms, privacy, and acceptable use policies, explain responsible API use,
+  and require their pages to return HTTP 200 before a release.
+- Verify logging excludes credentials, signed upload queries, and audio content
+  for both clients while preserving debug request IDs and HTTP status codes.
+
+### Fixed
+
+- Send an explicit release-checker User-Agent when verifying policy pages.
+
+### Changed
+
+- Refresh the public API contract with supported batch submission sources.
+- Update locked development dependencies, including Pydantic security fixes,
+  and align development and CI tooling with the lockfile format.
+
 ## 0.2.2 — 2026-10-07
 
 ### Fixed

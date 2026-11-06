@@ -1,5 +1,5 @@
 """Generated service contract; do not edit."""
-# contract-sha256: 173cee2f13f016d05db9520b57c1bfb1e5817f2f6da99f85303f604344fd2c59
+# contract-sha256: 226b47175f903f8ef39679fbf36594264505c63d4a8901d728a6a046350f800e
 
 from collections.abc import Mapping
 from typing import NamedTuple
@@ -163,6 +163,8 @@ RETRY_AFTER_HEADER: str = "Retry-After"
 DEFAULT_SYNC_CAP_BYTES: int = 26214400
 
 MAX_BATCH_SUBMISSIONS: int = 64
+
+BATCH_SUBMIT_SOURCES: frozenset[str] = frozenset({"url", "upload_id"})
 
 MAX_BATCH_BODY_BYTES: int = 4195328
 

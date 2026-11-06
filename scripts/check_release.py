@@ -11,6 +11,8 @@ import zipfile
 from email.parser import BytesParser
 from functools import lru_cache
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 VERSION_FILE = Path(__file__).resolve().parents[1] / "src" / "machinera" / "_version.py"
 
@@ -203,6 +205,34 @@ def package_version(root: Path = ROOT) -> str:
     raise ValueError("Package version not found")
 
 
+def check_policy_pages(root: Path = ROOT) -> None:
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    section = re.search(
+        r"^## Terms, privacy and acceptable use\n(.*?)(?=^## |\Z)",
+        readme,
+        re.MULTILINE | re.DOTALL,
+    )
+    urls = [] if section is None else re.findall(r"\[[^\]]+\]\((https?://[^\s)]+)\)", section[1])
+    if not urls:
+        raise ValueError("README policy links are missing")
+    for url in dict.fromkeys(urls):
+        try:
+            # urlopen follows HTTP redirects and uses GET when no data is supplied.
+            request = Request(
+                url, headers={"User-Agent": f"machinera-python-release-check/{package_version()}"}
+            )
+            with urlopen(request, timeout=5) as response:
+                status = response.status
+        except HTTPError as error:
+            raise ValueError(f"Policy page {url}: HTTP {error.code}; expected HTTP 200") from error
+        except (URLError, OSError) as error:
+            raise ValueError(
+                f"Policy page {url}: network error ({error}); expected HTTP 200"
+            ) from error
+        if status != 200:
+            raise ValueError(f"Policy page {url}: HTTP {status}; expected HTTP 200")
+
+
 def check_release(tag: str, directory: Path) -> None:
     check_public_sources()
     __version__ = package_version()
@@ -234,6 +264,8 @@ def check_release(tag: str, directory: Path) -> None:
         metadata = BytesParser().parsebytes(content)
         if metadata["Name"] != "machinera" or metadata["Version"] != __version__:
             raise ValueError("Distribution metadata does not match the package name and version")
+
+    check_policy_pages()
 
 
 def main() -> None:

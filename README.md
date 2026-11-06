@@ -9,6 +9,19 @@ This SDK requires the numeric-code API. Error and warning `code` values are
 integers; string codes are unsupported. SDK 0.1.x cannot talk to the server after
 this API cut. Record the integer `error.code` and `error.request_id` for support.
 
+## Terms, privacy and acceptable use
+
+Review the [Terms of Service](https://transcribe.machinera.com/transcribe/terms),
+[Privacy Policy](https://transcribe.machinera.com/transcribe/privacy), and
+[Acceptable Use Policy](https://transcribe.machinera.com/transcribe/acceptable-use).
+
+### Using the API responsibly
+
+API use is subject to those terms. The service is offered to adults (18+) in the
+United States and Canada outside Quebec. You are responsible for having the consent
+of every recorded person where the law requires it. Audio and transcripts are
+retained only for the periods described in the Privacy Policy.
+
 ## Install
 
 ```sh
